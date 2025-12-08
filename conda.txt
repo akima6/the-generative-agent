@@ -1,0 +1,3 @@
+conda activate generative_agent
+conda activate matgl_env
+conda activate megnet_legacy_env
