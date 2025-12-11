@@ -4,7 +4,6 @@ import numpy as np
 import re
 import torch
 import sys
-from .utils import letter_to_number
 def letter_to_number(letter):
     """
     'a' to 1 , 'b' to 2 , 'z' to 26, and 'A' to 27
