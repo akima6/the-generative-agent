@@ -36,8 +36,8 @@ NUM_ITERATIONS = 5
 LR = 1e-5         
 CLIP_EPS = 0.2    
 BETA = 0.05       
-SPACE_GROUP = 225 # Fm-3m 
-TEMP = 1.0        # Sampling temperature
+SPACE_GROUP = 225 
+TEMP = 1.0        
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -49,8 +49,6 @@ def load_config_and_model():
 
     print(f"Initializing PyTorch Model on {DEVICE}...")
     
-    # Initialize Model
-    # Note: 'key' is ignored in PyTorch version but kept for signature compatibility if needed
     transformer = make_transformer(
         key=None,
         Nf=config['Nf'], Kx=config['Kx'], Kl=config['Kl'], n_max=config['n_max'],
@@ -64,10 +62,17 @@ def load_config_and_model():
     # Load Weights
     if os.path.exists(CHECKPOINT_PATH):
         print(f"Loading Checkpoint from {CHECKPOINT_PATH}")
-        checkpoint = torch.load(CHECKPOINT_PATH, map_location=DEVICE)
+        # FIX FOR PYTORCH 2.6+: Explicitly set weights_only=False
+        try:
+            checkpoint = torch.load(CHECKPOINT_PATH, map_location=DEVICE, weights_only=False)
+        except TypeError:
+            # Fallback for older PyTorch versions that don't accept weights_only
+            checkpoint = torch.load(CHECKPOINT_PATH, map_location=DEVICE)
+            
         if 'model_state_dict' in checkpoint:
             transformer.load_state_dict(checkpoint['model_state_dict'])
         else:
+            # Assuming the file contains only the state_dict
             transformer.load_state_dict(checkpoint)
     else:
         print(f"Warning: Checkpoint {CHECKPOINT_PATH} not found. Using random init.")
@@ -75,47 +80,34 @@ def load_config_and_model():
     return config, transformer
 
 def main():
+    # The rest of main() function is unchanged, running the PPO loop...
+    # ... (omitted for brevity)
+    
     print("--- STARTING NOVAGEN DISCOVERY ENGINE (PHASE 2 - PYTORCH INTEGRATED) ---")
     
     # 1. INITIALIZATION
     config, transformer = load_config_and_model()
     
-    # Create Frozen Pretrain Model for KL calculation
+    # Clone for pretrain reference
     transformer_pretrain = copy.deepcopy(transformer)
     transformer_pretrain.eval()
     for p in transformer_pretrain.parameters():
         p.requires_grad = False
         
-    # Optimizer
     optimizer = optim.Adam(transformer.parameters(), lr=LR)
     
-    # Initialize Loss Functions
-    # make_loss_fn returns (loss_fn, logp_fn)
-    # We only need logp_fn for PPO, but loss_fn helper is useful.
-    # In PyTorch rewrite, make_loss_fn returns (loss_fn, logp_fn).
     _, logp_fn = make_loss_fn(
         config['n_max'], config['atom_types'], config['wyck_types'],
         config['Kx'], config['Kl'], transformer
     )
     
-    # PPO Loss Factory
-    # make_ppo_loss_fn returns a function: ppo_loss_fn(model, x, old_logp, pretrain_logp, advantages)
     ppo_loss_calc = make_ppo_loss_fn(logp_fn, CLIP_EPS, BETA)
 
-    # Initialize Judges
     reward_calc = RewardCalculator()
     
-    # Sampling Constants
-    # atom_mask and constraints logic handled inside sample_crystal or passed as None
     atom_mask = torch.zeros((config['n_max'], config['atom_types']), device=DEVICE) 
-    # (Assuming simple mask or None)
-    
-    # Constraints: JAX version used jnp.arange. PyTorch version expects similar or None.
-    # If constraints[i] < i, it copies. 
-    # We pass None for unconstrained generation for now.
     constraints = torch.arange(config['n_max'], device=DEVICE)
 
-    # Baseline
     global_baseline = -3.0
     
     # 3. THE TRAINING LOOP
@@ -125,43 +117,27 @@ def main():
         # --- STEP A: DREAMING (Sampling) ---
         print("1. Sampling new crystals...")
         
-        # Call the Rewritten sample_crystal
-        # Signature: sample_crystal(key, transformer, params, n_max, batchsize, ...)
-        # We pass None for key/params as PyTorch model has them.
         with torch.no_grad():
             XYZ, A, W, M, L_real = sample_crystal(
-                key=None,
-                transformer=transformer,
-                params=None,
-                n_max=config['n_max'],
-                batchsize=BATCH_SIZE,
-                atom_types=config['atom_types'],
-                wyck_types=config['wyck_types'],
-                Kx=config['Kx'],
-                Kl=config['Kl'],
-                g=SPACE_GROUP,
-                w_mask=None,
-                atom_mask=None, # pass atom_mask if strictly needed
-                top_p=1.0,      # nucleus sampling off
-                temperature=TEMP,
-                T1=TEMP,
+                key=None, transformer=transformer, params=None,
+                n_max=config['n_max'], batchsize=BATCH_SIZE,
+                atom_types=config['atom_types'], wyck_types=config['wyck_types'],
+                Kx=config['Kx'], Kl=config['Kl'], g=SPACE_GROUP,
+                w_mask=None, atom_mask=None, top_p=1.0, temperature=TEMP, T1=TEMP,
                 constraints=constraints
             )
         
         G = torch.full((BATCH_SIZE,), SPACE_GROUP, device=DEVICE)
         
         # --- STEP B: MEMORIZING (Log Probs) ---
-        # Normalize Lattice
         L_norm = norm_lattice(G, W, L_real)
         
-        # Calculate Old Log Probs (no grad)
         with torch.no_grad():
             lp_w, lp_xyz, lp_a, lp_l = logp_fn(
                 transformer, G, L_norm, XYZ, A, W, is_train=False
             )
             old_logp = lp_w + lp_xyz + lp_a + lp_l
             
-            # Pretrain Log Probs
             pp_w, pp_xyz, pp_a, pp_l = logp_fn(
                 transformer_pretrain, G, L_norm, XYZ, A, W, is_train=False
             )
@@ -169,7 +145,6 @@ def main():
 
         # --- STEP C: REALITY CHECK (Reward) ---
         print("2. Converting to Physical Structures...")
-        # TensorBridge expects Tensors, converts to CPU numpy
         structures = TensorBridge.batch_to_structures(G, L_real, XYZ, A, M)
         
         valid_count = sum(1 for s in structures if s is not None)
@@ -195,8 +170,6 @@ def main():
         for ppo_epoch in range(PPO_EPOCHS):
             optimizer.zero_grad()
             
-            # PPO Loss Calculation (Rewritten ppo.py)
-            # Returns: (loss, kl) where loss is negative objective (to be minimized)
             loss, kl = ppo_loss_calc(transformer, x_data, old_logp, pretrain_logp, advantages)
             
             loss.backward()
@@ -209,11 +182,8 @@ def main():
     print("\nTraining Complete.")
     save_path = os.path.join(PROJECT_ROOT, "pretrained_model", "finetuned_semiconductor.pt")
     print(f"Saving new brain to: {save_path}")
-    torch.save({
-        'model_state_dict': transformer.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'config': config
-    }, save_path)
+    torch.save(transformer.state_dict(), save_path)
+
 
 if __name__ == "__main__":
     main()
