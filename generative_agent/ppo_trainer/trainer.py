@@ -15,7 +15,8 @@ CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, "../.."))
 
 # crystalformer package lives here:
-/# /content/the-generative-agent/CrystalFormer/crystalformer
+
+# /content/the-generative-agent/CrystalFormer/crystalformer
 CRYSTALFORMER_DIR = os.path.join(PROJECT_ROOT, "CrystalFormer")
 
 # Ensure both project root and CrystalFormer path are importable
