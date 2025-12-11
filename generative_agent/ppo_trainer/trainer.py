@@ -29,17 +29,24 @@ from bridge import TensorBridge
 CONFIG_PATH = os.path.join(PROJECT_ROOT, "pretrained_model", "config.yaml")
 CHECKPOINT_PATH = os.path.join(PROJECT_ROOT, "pretrained_model", "epoch_005500.pt")
 
-# Training Hyperparameters
+# Training Hyperparameters - INCREASED ITERATIONS
 BATCH_SIZE = 4    
 PPO_EPOCHS = 2    
-NUM_ITERATIONS = 5 
+NUM_ITERATIONS = 50 # <-- INCREASED FOR MEANINGFUL RUN
 LR = 1e-5         
 CLIP_EPS = 0.2    
 BETA = 0.05       
 SPACE_GROUP = 225 
 TEMP = 1.0        
 
+# CRITICAL FIX: Ensure device is CUDA even if PyTorch initially fails to find it.
+# We trust the Diagnostic 1 output that a T4 is available.
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if DEVICE.type == 'cpu' and 'cuda' in os.environ.get('ACCELERATOR_TYPE', '').lower():
+    # Force CUDA if we are sure it should be available (Colab quirk)
+    DEVICE = torch.device("cuda:0")
+    print(f"[NOTE] Forcing PyTorch device to CUDA based on environment check.")
+
 
 def load_config_and_model():
     """Loads the architecture config and the pretrained weights."""
@@ -80,9 +87,6 @@ def load_config_and_model():
     return config, transformer
 
 def main():
-    # The rest of main() function is unchanged, running the PPO loop...
-    # ... (omitted for brevity)
-    
     print("--- STARTING NOVAGEN DISCOVERY ENGINE (PHASE 2 - PYTORCH INTEGRATED) ---")
     
     # 1. INITIALIZATION
