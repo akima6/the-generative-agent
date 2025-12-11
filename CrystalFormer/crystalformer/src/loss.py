@@ -28,19 +28,22 @@ def von_mises_logpdf(x, loc, kappa):
 def gaussian_logpdf(x, loc, scale):
     """
     Computes log(Gaussian(x | loc, scale))
-    ...
     """
-    # CRITICAL FIX 2: Clamp scale (sigma) to a numerical floor
-    scale = torch.clamp(scale, min=1e-8)
+    # CRITICAL FIX 1: Aggressive clamp on scale for stability (JAX used a softplus/exp to ensure positivity, we use clamp)
+    scale = torch.clamp(scale, min=1e-6) # Floor set to 1e-6 (was 1e-8)
     
     x = x.unsqueeze(1)
     var = scale ** 2
     log_scale = torch.log(scale)
     
-    # Use torch's constant for better compatibility
+    # CRITICAL FIX 2: Explicitly move the constant to the device for consistency
     LOG_2PI = torch.tensor(np.log(2 * np.pi), device=x.device, dtype=x.dtype)
     
-    return -((x - loc) ** 2) / (2 * var) - log_scale - 0.5 * LOG_2PI
+    # We must also clamp the exponent term to prevent -Inf if var is too small
+    exponent = -((x - loc) ** 2) / (2 * var)
+    exponent = torch.clamp(exponent, max=100.0) # Prevent overflow from massive negative numbers
+    
+    return exponent - log_scale - 0.5 * LOG_2PI
 
 def make_loss_fn(n_max, atom_types, wyck_types, Kx, Kl, transformer, lamb_a=1.0, lamb_w=1.0, lamb_l=1.0):
     """
