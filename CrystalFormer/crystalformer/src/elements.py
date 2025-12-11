@@ -54,6 +54,3 @@ if __name__=="__main__":
     atom_mask = [1] + [1 if i not in radioactive_elements_dict.values() and i not in noble_gas_dict.values() else 0 for i in range(1, atom_types)]
     print('sampling structure formed by non-radioactive elements and non-noble gas')
     print(atom_mask)
-
-
-

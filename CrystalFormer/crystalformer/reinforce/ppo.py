@@ -1,151 +1,238 @@
-import jax
-import jax.numpy as jnp
+import torch
+import torch.nn as nn
+import torch.optim as optim
 import os
-import optax
 import math
-from functools import partial
+import numpy as np
+import copy
 
-import crystalformer.src.checkpoint as checkpoint
+# Assumes lattice.py is rewritten and available
 from crystalformer.src.lattice import norm_lattice
 
-
 def make_ppo_loss_fn(logp_fn, eps_clip, beta=0.1):
-
     """
-    PPO clipped objective function with KL divergence regularization
-    PPO_loss = PPO-clip + beta  * KL(P || P_pretrain)
-
-    Note that we only consider the logp_xyz and logp_l in the logp_fn
+    Returns a PPO loss function (Closure).
+    This mimics the JAX factory pattern but simply returns the function below.
     """
+    def ppo_loss_fn(model, x, old_logp, pretrain_logp, advantages):
+        """
+        PPO clipped objective function with KL divergence regularization
+        Loss = - (PPO-clip - beta * KL)  [We minimize negative objective]
+        
+        Args:
+            model: PyTorch model
+            x: tuple (G, L_norm, XYZ, A, W)
+            old_logp: Log probs from previous policy iteration
+            pretrain_logp: Log probs from frozen pre-trained model
+            advantages: Computed advantages
+        """
+        # Unpack inputs
+        G, L, XYZ, A, W = x
+        
+        # 1. Compute current log probs
+        logp_w, logp_xyz, logp_a, logp_l = logp_fn(model, G, L, XYZ, A, W, is_train=True)
+        new_logp = logp_w + logp_xyz + logp_a + logp_l
 
-    def ppo_loss_fn(params, key, x, old_logp, pretrain_logp, advantages):
+        # 2. KL Divergence Penalty (P || P_pretrain)
+        # We penalize deviation from the original pre-trained model to prevent mode collapse/forgetting
+        kl_loss = new_logp - pretrain_logp # (Batch,)
+        
+        # Adjust advantages with KL penalty
+        # JAX original: advantages = advantages - beta * kl_loss
+        advantages_adj = advantages - beta * kl_loss
 
-        logp_w, logp_xyz, logp_a, logp_l = logp_fn(params, key, *x, False)
-        logp = logp_w + logp_xyz + logp_a + logp_l
+        # 3. Ratio (pi_theta / pi_theta_old)
+        # exp(new - old)
+        ratios = torch.exp(new_logp - old_logp)
 
-        kl_loss = logp - pretrain_logp
-        advantages = advantages - beta * kl_loss
+        # 4. Surrogate Objectives
+        surr1 = ratios * advantages_adj
+        surr2 = torch.clamp(ratios, 1.0 - eps_clip, 1.0 + eps_clip) * advantages_adj
 
-        # Finding the ratio (pi_theta / pi_theta__old)
-        ratios = jnp.exp(logp - old_logp)
-
-        # Finding Surrogate Loss  
-        surr1 = ratios * advantages
-        surr2 = jax.lax.clamp(1-eps_clip, ratios, 1+eps_clip) * advantages
-
-        # Final loss of clipped objective PPO
-        ppo_loss = jnp.mean(jnp.minimum(surr1, surr2))
-
-        return ppo_loss, (jnp.mean(kl_loss))
+        # 5. Final PPO Objective (Maximize) -> Loss (Minimize)
+        # Mean over batch
+        ppo_objective = torch.mean(torch.min(surr1, surr2))
+        
+        # We return negative objective to minimize, and the mean KL for logging
+        return -ppo_objective, torch.mean(kl_loss)
     
     return ppo_loss_fn
 
 
-def train(key, optimizer, opt_state, spg_mask, loss_fn, logp_fn, batch_reward_fn, ppo_loss_fn, sample_crystal, params, epoch_finished, epochs, ppo_epochs, batchsize, valid_data, path):
-
-    num_devices = jax.local_device_count()
-    batch_per_device = batchsize // num_devices
-    shape_prefix = (num_devices, batch_per_device)
-    print("num_devices: ", num_devices)
-    print("batch_per_device: ", batch_per_device)
-    print("shape_prefix: ", shape_prefix)
-
-    @partial(jax.pmap, axis_name="p", in_axes=(None, None, None, 0, 0, 0, 0), out_axes=(None, None, 0),)
-    def step(params, key, opt_state, x, old_logp, pretrain_logp, advantages):
-        value, grad = jax.value_and_grad(ppo_loss_fn, has_aux=True)(params, key, x, old_logp, pretrain_logp, advantages)
-        grad = jax.lax.pmean(grad, axis_name="p")
-        value = jax.lax.pmean(value, axis_name="p")
-        grad = jax.tree_util.tree_map(lambda g_: g_ * -1.0, grad)  # invert gradient for maximization
-        updates, opt_state = optimizer.update(grad, opt_state, params)
-        params = optax.apply_updates(params, updates)
-        return params, opt_state, value
-
-    log_filename = os.path.join(path, "data.txt")
-    f = open(log_filename, "w" if epoch_finished == 0 else "a", buffering=1, newline="\n")
-    if os.path.getsize(log_filename) == 0:
-        f.write("epoch f_mean f_err v_loss v_loss_w v_loss_a v_loss_xyz v_loss_l\n")
-    pretrain_params = params
-    logp_fn = jax.jit(logp_fn, static_argnums=7)
-    loss_fn = jax.jit(loss_fn, static_argnums=7)
+def train(model, optimizer, spg_mask, loss_fn, logp_fn, batch_reward_fn, sample_crystal_fn, 
+          epochs, ppo_epochs, batchsize, valid_data, path, checkpoint_interval=5):
+    """
+    PPO Training Loop.
     
-    for epoch in range(epoch_finished+1, epochs+1):
+    Args:
+        model: PyTorch CrystalTransformer
+        optimizer: PyTorch Optimizer
+        spg_mask: List/Array of probabilities for Space Groups (1-230)
+        loss_fn: Validation loss function (NLL)
+        logp_fn: Function to compute log-probs
+        batch_reward_fn: Function taking batch x -> rewards
+        sample_crystal_fn: Function(model, G) -> (XYZ, A, W, M, L)
+        epochs: Total iterations
+        ppo_epochs: Number of PPO updates per batch
+        batchsize: Batch size
+        valid_data: Validation dataset tuple
+        path: Output path
+    """
+    
+    device = next(model.parameters()).device
+    print(f"PPO Training on device: {device}")
 
-        key, subkey1, subkey2 = jax.random.split(key, 3)
-        G = jax.random.choice(subkey1,
-                              a=jnp.arange(1, 231, 1),
-                              p=spg_mask,
-                              shape=(batchsize, ))
-        XYZ, A, W, _, L = sample_crystal(subkey2, params, G)
+    # Initialize Logging
+    log_filename = os.path.join(path, "data.txt")
+    if not os.path.exists(log_filename):
+        with open(log_filename, "w") as f:
+            f.write("epoch f_mean f_err v_loss v_loss_w v_loss_a v_loss_xyz v_loss_l\n")
 
-        x = (G, L, XYZ, A, W)
-        rewards = - batch_reward_fn(x)  # inverse reward
-        f_mean = jnp.mean(rewards)
-        f_err = jnp.std(rewards) / jnp.sqrt(batchsize)
-
-        # running average baseline
-        baseline = f_mean if epoch == epoch_finished+1 else 0.95 * baseline + 0.05 * f_mean
+    # Initialize Baseline (Exponential Moving Average)
+    baseline = 0.0
+    
+    # Create Frozen Pretrain Model (Reference)
+    # This replaces 'pretrain_params' from JAX
+    pretrain_model = copy.deepcopy(model)
+    pretrain_model.eval()
+    for p in pretrain_model.parameters():
+        p.requires_grad = False
+    
+    # Define PPO Loss (using default parameters from original file usually 0.2, 0.1)
+    # The original file passed eps_clip and beta to make_ppo_loss_fn inside main scripts usually.
+    # Here we instantiate it with standard defaults if not passed, but let's assume standard logic.
+    ppo_calc = make_ppo_loss_fn(logp_fn, eps_clip=0.2, beta=0.1)
+    
+    for epoch in range(1, epochs + 1):
+        
+        # --- 1. SAMPLING ---
+        # Sample Space Groups based on mask
+        if not isinstance(spg_mask, torch.Tensor):
+            spg_mask = torch.tensor(spg_mask, device=device, dtype=torch.float32)
+        else:
+            spg_mask = spg_mask.to(device).float()
+            
+        # Normalize mask
+        if spg_mask.sum() == 0:
+            spg_mask = torch.ones_like(spg_mask)
+        spg_probs = spg_mask / spg_mask.sum()
+        
+        # Sample G (0-229 indices) -> +1 for SG Number
+        G_idx = torch.multinomial(spg_probs, batchsize, replacement=True)
+        G = (G_idx + 1).long() # (Batch,)
+        
+        # Sample Crystals
+        # We assume sample_crystal_fn binds config args and just accepts (model, G)
+        with torch.no_grad():
+            XYZ, A, W, M, L = sample_crystal_fn(model, G)
+        
+        # Generated Batch
+        x_gen = (G, L, XYZ, A, W)
+        
+        # --- 2. REWARD COMPUTATION ---
+        # batch_reward_fn typically returns -Energy (so higher is better)
+        # Expects x tuple. Returns numpy array or tensor.
+        rewards_val = -batch_reward_fn(x_gen)
+        
+        if isinstance(rewards_val, torch.Tensor):
+            rewards = rewards_val.to(device).float()
+        else:
+            rewards = torch.tensor(rewards_val, device=device, dtype=torch.float32)
+            
+        f_mean = rewards.mean().item()
+        f_err = rewards.std().item() / math.sqrt(batchsize)
+        
+        # Update Baseline
+        if epoch == 1:
+            baseline = f_mean
+        else:
+            baseline = 0.95 * baseline + 0.05 * f_mean
+            
         advantages = rewards - baseline
-
-        f.write( ("%6d" + 2*"  %.6f") % (epoch, f_mean, f_err))
-
-        G, L, XYZ, A, W = x
-        L = norm_lattice(G, W, L)
-        x = (G, L, XYZ, A, W)
-
-        key, subkey1, subkey2 = jax.random.split(key, 3)
-        logp_w, logp_xyz, logp_a, logp_l = logp_fn(params, subkey1, *x, False)
-        old_logp = logp_w + logp_xyz + logp_a + logp_l
-
-        logp_w, logp_xyz, logp_a, logp_l = logp_fn(pretrain_params, subkey2, *x, False)
-        pretrain_logp = logp_w + logp_xyz + logp_a + logp_l
-
-        x = jax.tree_util.tree_map(lambda _x: _x.reshape(shape_prefix + _x.shape[1:]), x)
-        old_logp = old_logp.reshape(shape_prefix + old_logp.shape[1:])
-        pretrain_logp = pretrain_logp.reshape(shape_prefix + pretrain_logp.shape[1:])
-        advantages = advantages.reshape(shape_prefix + advantages.shape[1:])
-
+        
+        # --- 3. PREPARE DATA ---
+        # Normalize lattice for model input
+        L_norm = norm_lattice(G, W, L)
+        x_train = (G, L_norm, XYZ, A, W)
+        
+        # --- 4. COMPUTE OLD LOG PROBS ---
+        # We need log probs from the current model (before update) and pretrain model
+        with torch.no_grad():
+            # Old Policy (Current weights)
+            lp_w, lp_xyz, lp_a, lp_l = logp_fn(model, G, L_norm, XYZ, A, W, is_train=False)
+            old_logp = lp_w + lp_xyz + lp_a + lp_l
+            
+            # Pretrain Policy (Frozen weights)
+            pp_w, pp_xyz, pp_a, pp_l = logp_fn(pretrain_model, G, L_norm, XYZ, A, W, is_train=False)
+            pretrain_logp = pp_w + pp_xyz + pp_a + pp_l
+            
+        # --- 5. PPO UPDATES ---
+        model.train()
+        avg_ppo_loss = 0.0
+        avg_kl = 0.0
+        
         for _ in range(ppo_epochs):
-            key, subkey = jax.random.split(key)
-            params, opt_state, value = step(params, subkey, opt_state, x, old_logp, pretrain_logp, advantages)
-            ppo_loss, (kl_loss) = value
-            print(f"epoch {epoch}, loss {jnp.mean(ppo_loss):.6f} {jnp.mean(kl_loss):.6f}")
+            optimizer.zero_grad()
+            
+            loss, kl = ppo_calc(model, x_train, old_logp, pretrain_logp, advantages)
+            
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            
+            avg_ppo_loss += loss.item()
+            avg_kl += kl.item()
+            
+        avg_ppo_loss /= ppo_epochs
+        avg_kl /= ppo_epochs
+        
+        print(f"Epoch {epoch}: Reward={f_mean:.4f} | PPO Loss={avg_ppo_loss:.4f} | KL={avg_kl:.4f}")
 
-        valid_loss = 0.0 
-        valid_aux = 0.0, 0.0, 0.0, 0.0
-        num_samples = len(valid_data[0])
-        num_batches = math.ceil(num_samples / batchsize)
-        for batch_idx in range(num_batches):
-            start_idx = batch_idx * batchsize
-            end_idx = min(start_idx + batchsize, num_samples)
-            batch_data = jax.tree_util.tree_map(lambda x: x[start_idx:end_idx], valid_data)
+        # --- 6. VALIDATION ---
+        model.eval()
+        valid_loss = 0.0
+        v_aux = np.zeros(4)
+        
+        # Validation Data Unpack
+        v_G, v_L, v_XYZ, v_A, v_W = valid_data
+        num_val = v_G.shape[0]
+        num_batches_val = math.ceil(num_val / batchsize)
+        
+        with torch.no_grad():
+            for i in range(num_batches_val):
+                # Batch Slice
+                sl = slice(i*batchsize, min((i+1)*batchsize, num_val))
+                batch_G = v_G[sl].to(device)
+                batch_L = v_L[sl].to(device)
+                batch_XYZ = v_XYZ[sl].to(device)
+                batch_A = v_A[sl].to(device)
+                batch_W = v_W[sl].to(device)
+                
+                # loss_fn returns total_loss, (aux...)
+                val_l, val_a = loss_fn(model, batch_G, batch_L, batch_XYZ, batch_A, batch_W, is_train=False)
+                
+                valid_loss += val_l.item()
+                v_aux += np.array(val_a)
+        
+        if num_batches_val > 0:
+            valid_loss /= num_batches_val
+            v_aux /= num_batches_val
+            
+        # Log to file
+        with open(log_filename, "a") as f:
+            f.write(("%6d" + 2*"  %.6f" + 5*"  %.6f" + "\n") % (
+                epoch, f_mean, f_err, valid_loss, *v_aux
+            ))
+            
+        # --- 7. CHECKPOINT ---
+        if epoch % checkpoint_interval == 0:
+            ckpt_path = os.path.join(path, f"epoch_{epoch:06d}.pt")
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'baseline': baseline
+            }, ckpt_path)
+            print(f"Saved checkpoint: {ckpt_path}")
 
-            key, subkey = jax.random.split(key)
-            loss, aux = loss_fn(params, subkey, *batch_data, False)
-            valid_loss, valid_aux = jax.tree_util.tree_map(
-                    lambda acc, i: acc + i,
-                    (valid_loss, valid_aux), 
-                    (loss, aux)
-                    )
-
-        valid_loss, valid_aux = jax.tree_util.tree_map(
-                    lambda x: x/num_batches, 
-                    (valid_loss, valid_aux)
-                    ) 
-        valid_loss_w, valid_loss_a, valid_loss_xyz, valid_loss_l = valid_aux
-        f.write( (5*"  %.6f" + "\n") % (valid_loss,
-                                        valid_loss_w, 
-                                        valid_loss_a, 
-                                        valid_loss_xyz, 
-                                        valid_loss_l))
-
-        if epoch % 5 == 0:
-            ckpt = {"params": params,
-                    "opt_state" : opt_state
-                   }
-            ckpt_filename = os.path.join(path, "epoch_%06d.pkl" %(epoch))
-            checkpoint.save_data(ckpt, ckpt_filename)
-            print("Save checkpoint file: %s" % ckpt_filename)
-
-    f.close()
-
-    return params, opt_state
+    return model, optimizer

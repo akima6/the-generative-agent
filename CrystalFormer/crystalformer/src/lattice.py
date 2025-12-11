@@ -1,5 +1,5 @@
-import jax
-import jax.numpy as jnp
+import torch
+import numpy as np
 from crystalformer.src.wyckoff import mult_table
 
 def make_lattice_mask():
@@ -19,52 +19,58 @@ def make_lattice_mask():
            [1, 0, 1, 0, 0, 0] * 52+\
            [1, 0, 0, 0, 0, 0] * 36
 
-    return jnp.array(mask).reshape(230, 6)
+    # Convert to tensor. Note: Device will be CPU by default, moved when needed.
+    return torch.tensor(mask, dtype=torch.int32).reshape(230, 6)
 
 def symmetrize_lattice(spacegroup, lattice):
     '''
-    place lattice params into lattice according to the space group 
+    Place lattice params into lattice according to the space group constraints.
+    Args:
+        spacegroup: (Batch,) or scalar Int Tensor
+        lattice: (Batch, 6) Float Tensor [a, b, c, alpha, beta, gamma]
+    Returns:
+        L: (Batch, 6) Symmetrized lattice
     '''
+    # Ensure inputs are tensors
+    if not isinstance(spacegroup, torch.Tensor):
+        spacegroup = torch.tensor(spacegroup)
+    if not isinstance(lattice, torch.Tensor):
+        lattice = torch.tensor(lattice)
+        
+    device = lattice.device
+    spacegroup = spacegroup.to(device)
 
-    a, b, c, alpha, beta, gamma = lattice
+    # Handle single sample case by unsqueezing
+    is_batch = lattice.ndim == 2
+    if not is_batch:
+        lattice = lattice.unsqueeze(0)
+        spacegroup = spacegroup.reshape(1)
 
-    L = lattice
-    L = jnp.where(spacegroup <= 2,   L, jnp.array([a, b, c, 90., beta, 90.]))
-    L = jnp.where(spacegroup <= 15,  L, jnp.array([a, b, c, 90., 90., 90.]))
-    L = jnp.where(spacegroup <= 74,  L, jnp.array([a, a, c, 90., 90., 90.]))
-    L = jnp.where(spacegroup <= 142, L, jnp.array([a, a, c, 90., 90., 120.]))
-    L = jnp.where(spacegroup <= 194, L, jnp.array([a, a, a, 90., 90., 90.]))
-
-    return L
-
-
-def norm_lattice(G, W, L):
-    """
-    normalize the lattice lengths by the number of atoms in the unit cell,
-    change the lattice angles to radian
-    a -> a/n_atoms^(1/3)
-    angle -> angle * pi/180
-    """
-    M = jax.vmap(lambda g, w: mult_table[g-1, w], in_axes=(0, 0))(G, W) # (batchsize, n_max)
-    num_atoms = jnp.sum(M, axis=1)
-    length, angle = jnp.split(L, 2, axis=-1)
-    length = length/num_atoms[:, None]**(1/3)
-    angle = angle * (jnp.pi / 180) # to rad
-    L = jnp.concatenate([length, angle], axis=-1)
+    a, b, c, alpha, beta, gamma = lattice.unbind(-1)
     
-    return L
+    # Constants
+    zero = torch.tensor(0.0, device=device, dtype=lattice.dtype)
+    ninety = torch.tensor(90.0, device=device, dtype=lattice.dtype)
+    onetwenty = torch.tensor(120.0, device=device, dtype=lattice.dtype)
 
-
-if __name__ == '__main__':
+    # Construct candidate lattices
+    # Triclinic (1-2): [a, b, c, alpha, beta, gamma] (Input)
     
-    mask = make_lattice_mask()
-    print (mask)
+    # Monoclinic (3-15): [a, b, c, 90, beta, 90]
+    L_mono = torch.stack([a, b, c, ninety, beta, ninety], dim=-1)
+    
+    # Orthorhombic (16-74): [a, b, c, 90, 90, 90]
+    L_ortho = torch.stack([a, b, c, ninety, ninety, ninety], dim=-1)
+    
+    # Tetragonal (75-142): [a, a, c, 90, 90, 90]
+    L_tetra = torch.stack([a, a, c, ninety, ninety, ninety], dim=-1)
+    
+    # Hexagonal/Trigonal (143-194): [a, a, c, 90, 90, 120]
+    L_hex = torch.stack([a, a, c, ninety, ninety, onetwenty], dim=-1)
+    
+    # Cubic (195-230): [a, a, a, 90, 90, 90]
+    L_cubic = torch.stack([a, a, a, ninety, ninety, ninety], dim=-1)
 
-    key = jax.random.PRNGKey(42)
-    lattice = jax.random.normal(key, (6,))
-    lattice = lattice.reshape([1, 6]).repeat(3, axis=0)
-
-    G = jnp.array([25, 99, 221])
-    L = jax.vmap(symmetrize_lattice)(G, lattice)
-    print (L)
-
+    # Apply constraints hierarchically using torch.where
+    # Logic:
+    # If SG <= 2:

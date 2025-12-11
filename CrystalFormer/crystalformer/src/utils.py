@@ -1,5 +1,4 @@
-import jax
-import jax.numpy as jnp
+import torch
 import numpy as np
 import pandas as pd
 from pyxtal import pyxtal
@@ -9,27 +8,91 @@ from functools import partial
 import multiprocessing
 import os
 
+# We assume these tables will be available from the rewritten wyckoff.py
 from crystalformer.src.wyckoff import mult_table
 from crystalformer.src.elements import element_list
 
-@jax.vmap
 def sort_atoms(W, A, X):
     """
-    lex sort atoms according W, X, Y, Z
-
-    W: (n, )
-    A: (n, )
-    X: (n, dim) int
+    Lex sort atoms according W, X, Y, Z.
+    Supports batched inputs.
+    
+    Args:
+        W: (Batch, n) or (n,)
+        A: (Batch, n) or (n,)
+        X: (Batch, n, 3) or (n, 3)
+        
+    Returns:
+        A: Sorted atom types
+        X: Sorted coordinates
     """
-    W_temp = jnp.where(W>0, W, 9999) # change 0 to 9999 so they remain in the end after sort
+    # Handle non-batched input by adding a batch dim temporarily
+    is_batched = W.ndim == 2
+    if not is_batched:
+        W = W.unsqueeze(0)
+        A = A.unsqueeze(0)
+        X = X.unsqueeze(0)
 
-    X -= jnp.floor(X)
-    idx = jnp.lexsort((X[:,2], X[:,1], X[:,0], W_temp))
+    # W_temp logic: change 0 to 9999 so they remain at the end after sort
+    # Original: jnp.where(W>0, W, 9999)
+    W_temp = torch.where(W > 0, W, torch.tensor(9999, device=W.device, dtype=W.dtype))
 
-    #assert jnp.allclose(W, W[idx])
-    A = A[idx]
-    X = X[idx]
-    return A, X
+    # X floor logic
+    X_floor = X - torch.floor(X)
+    
+    # Lexsort: JAX/Numpy lexsort((k1, k2, k3, k4)) uses k4 as primary.
+    # Keys from original: (X[:,2], X[:,1], X[:,0], W_temp)
+    # So W_temp is Primary, X0 Secondary, X1 Tertiary, X2 Quaternary.
+    # In PyTorch, we can achieve this by performing stable sorts in REVERSE order of importance:
+    # Sort by X2, then X1, then X0, then W_temp.
+    
+    # We need to sort along the 'n' dimension (dim=1)
+    
+    # 1. Sort by X[:, :, 2]
+    idx = torch.argsort(X_floor[:, :, 2], dim=1, stable=True)
+    W_temp = torch.gather(W_temp, 1, idx)
+    X_floor = torch.gather(X_floor, 1, idx.unsqueeze(-1).expand(-1, -1, 3))
+    # We also need to permute the original A and X to keep them in sync for the next sort steps
+    # But actually, we just need the final indices. 
+    # To do this correctly without re-indexing everything repeatedly, 
+    # we can re-order the keys step-by-step.
+    
+    # Let's restart with a cleaner approach for indices:
+    # Initialize indices as 0..n
+    batch_size, n = W.shape
+    indices = torch.arange(n, device=W.device).unsqueeze(0).expand(batch_size, -1) # (B, n)
+    
+    keys = [
+        X_floor[:, :, 2], # Least significant
+        X_floor[:, :, 1],
+        X_floor[:, :, 0],
+        W_temp            # Most significant
+    ]
+    
+    for k in keys:
+        # Gather the current key using the current best permutation
+        # k is (B, n). We want k_ordered = k[indices]
+        k_ordered = torch.gather(k, 1, indices)
+        
+        # Sort this key (stable)
+        sort_idx = torch.argsort(k_ordered, dim=1, stable=True)
+        
+        # Update the global indices
+        indices = torch.gather(indices, 1, sort_idx)
+
+    # Apply final indices to A and X
+    # A: (B, n)
+    A_sorted = torch.gather(A, 1, indices)
+    
+    # X: (B, n, 3)
+    # Expand indices to (B, n, 3)
+    indices_expanded = indices.unsqueeze(-1).expand(-1, -1, 3)
+    X_sorted = torch.gather(X, 1, indices_expanded)
+
+    if not is_batched:
+        return A_sorted.squeeze(0), X_sorted.squeeze(0)
+    
+    return A_sorted, X_sorted
 
 def letter_to_number(letter):
     """
@@ -37,32 +100,21 @@ def letter_to_number(letter):
     """
     return ord(letter) - ord('a') + 1 if 'a' <= letter <= 'z' else 27 if letter == 'A' else None
 
-def shuffle(key, data):
+def shuffle(data):
     """
     shuffle data along batch dimension
+    Args:
+        data: tuple of tensors (G, L, XYZ, A, W)
     """
     G, L, XYZ, A, W = data
-    idx = jax.random.permutation(key, jnp.arange(len(L)))
+    batch_size = len(L)
+    idx = torch.randperm(batch_size)
     return G[idx], L[idx], XYZ[idx], A[idx], W[idx]
     
 def process_one(cif, atom_types, wyck_types, n_max, tol=0.01):
     """
-    # taken from https://anonymous.4open.science/r/DiffCSP-PP-8F0D/diffcsp/common/data_utils.py
     Process one cif string to get G, L, XYZ, A, W
-
-    Args:
-      cif: cif string
-      atom_types: number of atom types
-      wyck_types: number of wyckoff types
-      n_max: maximum number of atoms in the unit cell
-      tol: tolerance for pyxtal
-
-    Returns:
-      G: space group number
-      L: lattice parameters
-      XYZ: fractional coordinates
-      A: atom types
-      W: wyckoff letters
+    (Kept largely original as it uses CPU-bound Pymatgen/PyXtal)
     """
     try: crystal = Structure.from_str(cif, fmt='cif')
     except: crystal = Structure.from_dict(eval(cif))
@@ -76,9 +128,9 @@ def process_one(cif, atom_types, wyck_types, n_max, tol=0.01):
     
     g = c.group.number
     num_sites = len(c.atom_sites)
-    assert (n_max > num_sites) # we will need at least one empty site for output of L params
+    assert (n_max > num_sites) 
 
-    print (g, c.group.symbol, num_sites)
+    # print (g, c.group.symbol, num_sites)
     natoms = 0
     ww = []
     aa = []
@@ -98,13 +150,13 @@ def process_one(cif, atom_types, wyck_types, n_max, tol=0.01):
         ww.append( w )
         fc.append( x )  # the generator of the orbit
         ws.append( symbol )
-        print ('g, a, w, m, symbol, x:', g, a, w, m, symbol, x)
+        # print ('g, a, w, m, symbol, x:', g, a, w, m, symbol, x)
     idx = np.argsort(ww)
     ww = np.array(ww)[idx]
     aa = np.array(aa)[idx]
     fc = np.array(fc)[idx].reshape(num_sites, 3)
     ws = np.array(ws)[idx]
-    print (ws, aa, ww, natoms) 
+    # print (ws, aa, ww, natoms) 
 
     aa = np.concatenate([aa,
                         np.full((n_max - num_sites, ), 0)],
@@ -121,28 +173,14 @@ def process_one(cif, atom_types, wyck_types, n_max, tol=0.01):
     angles = np.array([c.lattice.alpha, c.lattice.beta, c.lattice.gamma])
     l = np.concatenate([abc, angles])
     
-    print ('===================================')
+    # print ('===================================')
 
     return g, l, fc, aa, ww 
 
 def GLXYZAW_from_file(csv_file, atom_types, wyck_types, n_max, num_workers=1):
     """
     Read cif strings from csv file and convert them to G, L, XYZ, A, W
-    Note that cif strings must be in the column 'cif'
-
-    Args:
-      csv_file: csv file containing cif strings
-      atom_types: number of atom types
-      wyck_types: number of wyckoff types
-      n_max: maximum number of atoms in the unit cell
-      num_workers: number of workers for multiprocessing
-
-    Returns:
-      G: space group number
-      L: lattice parameters
-      XYZ: fractional coordinates
-      A: atom types
-      W: wyckoff letters
+    Returns PyTorch Tensors.
     """
     if csv_file.endswith('.lmdb'):
         import lmdb
@@ -165,6 +203,12 @@ def GLXYZAW_from_file(csv_file, atom_types, wyck_types, n_max, num_workers=1):
         print('XYZ:', XYZ.shape)
         print('A:', A.shape)
         print('W:', W.shape)
+        # Convert to torch
+        G = torch.from_numpy(G) if isinstance(G, np.ndarray) else torch.tensor(G)
+        L = torch.from_numpy(L) if isinstance(L, np.ndarray) else torch.tensor(L)
+        XYZ = torch.from_numpy(XYZ) if isinstance(XYZ, np.ndarray) else torch.tensor(XYZ)
+        A = torch.from_numpy(A) if isinstance(A, np.ndarray) else torch.tensor(A)
+        W = torch.from_numpy(W) if isinstance(W, np.ndarray) else torch.tensor(W)
         return G, L, XYZ, A, W
 
     data = pd.read_csv(csv_file)
@@ -179,28 +223,21 @@ def GLXYZAW_from_file(csv_file, atom_types, wyck_types, n_max, num_workers=1):
 
     G, L, XYZ, A, W = zip(*results)
 
-    G = jnp.array(G) 
-    A = jnp.array(A).reshape(-1, n_max)
-    W = jnp.array(W).reshape(-1, n_max)
-    XYZ = jnp.array(XYZ).reshape(-1, n_max, 3)
-    L = jnp.array(L).reshape(-1, 6)
+    # Convert to Tensors
+    G = torch.tensor(np.array(G))
+    A = torch.tensor(np.array(A)).reshape(-1, n_max)
+    W = torch.tensor(np.array(W)).reshape(-1, n_max)
+    XYZ = torch.tensor(np.array(XYZ)).reshape(-1, n_max, 3)
+    L = torch.tensor(np.array(L)).reshape(-1, 6)
 
+    # Sort
     A, XYZ = sort_atoms(W, A, XYZ)
     
     return G, L, XYZ, A, W
 
 def GLXA_to_structure_single(G, L, X, A):
     """
-    Convert G, L, X, A to pymatgen structure. Do not use this function due to the bug in pymatgen.
-
-    Args:
-      G: space group number
-      L: lattice parameters
-      X: fractional coordinates
-      A: atom types
-    
-    Returns:
-      structure: pymatgen structure
+    Convert G, L, X, A to pymatgen structure.
     """
     lattice = Lattice.from_parameters(*L)
     # filter out padding atoms
@@ -213,12 +250,14 @@ def GLXA_to_structure_single(G, L, X, A):
 
 def GLXA_to_csv(G, L, X, A, num_worker=1, filename='out_structure.csv'):
 
-    L = np.array(L)
-    X = np.array(X)
-    A = np.array(A)
+    # Ensure inputs are numpy for multiprocessing compatibility
+    if isinstance(L, torch.Tensor): L = L.detach().cpu().numpy()
+    if isinstance(X, torch.Tensor): X = X.detach().cpu().numpy()
+    if isinstance(A, torch.Tensor): A = A.detach().cpu().numpy()
+    if isinstance(G, torch.Tensor): G = G.detach().cpu().numpy()
+    if isinstance(G, int): G = np.array([G] * len(L))
+    
     p = multiprocessing.Pool(num_worker)
-    if isinstance(G, int):
-        G = np.array([G] * len(L))
     structures = p.starmap_async(GLXA_to_structure_single, zip(G, L, X, A)).get()
     p.close()
     p.join()
@@ -237,25 +276,37 @@ if __name__=='__main__':
     import numpy as np 
     np.set_printoptions(threshold=np.inf)
     
-    #csv_file = '../data/mini.csv'
-    #csv_file = '/home/wanglei/cdvae/data/carbon_24/val.csv'
-    #csv_file = '/home/wanglei/cdvae/data/perov_5/val.csv'
-    csv_file = '/home/wanglei/cdvae/data/mp_20/train.csv'
+    # Example CSV path (dummy)
+    # csv_file = 'test.csv'
 
-    G, L, XYZ, A, W = GLXYZAW_from_file(csv_file, atom_types, wyck_types, n_max)
+    # To run this main block, ensure you have a valid csv or disable the GLXYZAW_from_file call
+    # G, L, XYZ, A, W = GLXYZAW_from_file(csv_file, atom_types, wyck_types, n_max)
     
-    print (G.shape)
-    print (L.shape)
-    print (XYZ.shape)
-    print (A.shape)
-    print (W.shape)
+    # print (G.shape)
+    # print (L.shape)
+    # print (XYZ.shape)
+    # print (A.shape)
+    # print (W.shape)
     
-    print ('L:\n',L)
-    print ('XYZ:\n',XYZ)
+    # print ('L:\n',L)
+    # print ('XYZ:\n',XYZ)
 
+    # Example of Lookup replacement
+    def lookup_torch(G, W):
+        # mult_table is (230, max_wyck)
+        # G: (Batch,)
+        # W: (Batch, n_max)
+        table = torch.tensor(mult_table) # Move to tensor
+        
+        # Adjust G to 0-indexed
+        G_idx = G - 1
+        
+        # We need to broadcast G to match W for gathering
+        # G_idx: (Batch, 1) -> (Batch, n_max)
+        G_expanded = G_idx.unsqueeze(1).expand(-1, W.shape[1])
+        
+        # Indexing: table[G, W]
+        return table[G_expanded.long(), W.long()]
 
-    @jax.vmap
-    def lookup(G, W):
-        return mult_table[G-1, W] # (n_max, )
-    M = lookup(G, W) # (batchsize, n_max)
-    print ('N:\n', M.sum(axis=-1))
+    # M = lookup_torch(G, W) 
+    # print ('N:\n', M.sum(dim=-1))

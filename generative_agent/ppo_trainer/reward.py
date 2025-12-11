@@ -5,6 +5,7 @@ import numpy as np
 import tempfile
 import subprocess
 import json
+from pymatgen.core import Structure
 from pymatgen.io.cif import CifWriter
 from pathlib import Path
 
@@ -13,6 +14,7 @@ CURRENT_DIR = Path(__file__).parent.resolve()
 PROJECT_ROOT = CURRENT_DIR.parent.parent
 sys.path.append(str(PROJECT_ROOT))
 
+# We assume the Oracle interface has been preserved or is compatible
 from generative_agent.evaluation_engine.oracle import Oracle
 
 # --- CONFIGURATION ---
@@ -113,27 +115,52 @@ class RewardCalculator:
         # Create temp directory for IO
         with tempfile.TemporaryDirectory() as tmp_in, tempfile.TemporaryDirectory() as tmp_out:
             cifs = []
+            valid_indices_filtered = []
+            
             for idx in valid_indices:
                 p = os.path.join(tmp_in, f"{idx}.cif")
                 try:
+                    # Write CIF
                     CifWriter(structures[idx]).write_file(p)
                     cifs.append(p)
-                except:
+                    valid_indices_filtered.append(idx)
+                except Exception as e:
+                    # print(f"CIF Write failed: {e}")
                     pass 
             
             if not cifs: return results
 
             # CALL THE WORKER (Environment B)
+            # Ensure the worker script exists
+            if not RELAXER_SCRIPT.exists():
+                print(f"[Error] Relaxer script not found at {RELAXER_SCRIPT}")
+                return results
+
             cmd = ["conda", "run", "-n", MATGL_ENV, "python", str(RELAXER_SCRIPT), tmp_out] + cifs
             
             try:
-                proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
-                data = json.loads(proc.stdout)
+                # Run with timeout to prevent hangs
+                proc = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=300)
+                
+                # Check for empty output
+                if not proc.stdout.strip():
+                    # print("[Reward] Relaxer returned no output.")
+                    return results
+
+                try:
+                    data = json.loads(proc.stdout)
+                except json.JSONDecodeError:
+                    print(f"[Reward] Relaxer JSON decode failed. Output: {proc.stdout[:100]}...")
+                    return results
                 
                 for item in data:
                     # Map back output filename "idx.cif" to list index
                     fname = os.path.basename(item.get("input_file", ""))
-                    idx = int(fname.split('.')[0])
+                    # Extract idx from filename (assuming simple naming "idx.cif")
+                    try:
+                        idx = int(fname.split('.')[0])
+                    except:
+                        continue
                     
                     if item.get("is_converged"):
                         try:
@@ -143,7 +170,11 @@ class RewardCalculator:
                             results[idx] = {"is_converged": False}
                     else:
                         results[idx] = {"is_converged": False}
+            except subprocess.TimeoutExpired:
+                print("[Reward] Relaxer timed out.")
+            except subprocess.CalledProcessError as e:
+                print(f"[Reward] Relaxer failed with code {e.returncode}. Stderr: {e.stderr[:200]}")
             except Exception as e:
-                print(f"[Reward] Relaxer failed: {e}")
+                print(f"[Reward] Relaxer unexpected error: {e}")
                 
         return results

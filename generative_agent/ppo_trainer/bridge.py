@@ -1,6 +1,6 @@
 # generative_agent/ppo_trainer/bridge.py
 import numpy as np
-import jax.numpy as jnp
+import torch
 from pymatgen.core import Structure, Lattice, Element
 import warnings
 
@@ -9,14 +9,21 @@ warnings.filterwarnings("ignore")
 
 class TensorBridge:
     """
-    Handles the conversion between JAX Tensors (Model Output) 
+    Handles the conversion between PyTorch Tensors (Model Output) 
     and Pymatgen Structures (Physics Object) without using disk I/O.
     """
     
     @staticmethod
+    def _to_numpy(x):
+        """Helper to convert Tensor/List to Numpy array safely."""
+        if isinstance(x, torch.Tensor):
+            return x.detach().cpu().numpy()
+        return np.array(x)
+
+    @staticmethod
     def batch_to_structures(G, L, XYZ, A, M):
         """
-        Convert batch of JAX tensors to a list of Pymatgen Structures.
+        Convert batch of PyTorch tensors to a list of Pymatgen Structures.
         
         Args:
             G: Space group numbers (batch,)
@@ -28,12 +35,12 @@ class TensorBridge:
         Returns:
             List of valid pymatgen.Structure objects. None for failed conversions.
         """
-        # Convert JAX/Torch tensors to standard Numpy arrays for CPU processing
-        G_np = np.array(G)
-        L_np = np.array(L)
-        XYZ_np = np.array(XYZ)
-        A_np = np.array(A)
-        M_np = np.array(M)
+        # Convert Torch tensors to standard Numpy arrays for CPU processing
+        G_np = TensorBridge._to_numpy(G)
+        L_np = TensorBridge._to_numpy(L)
+        XYZ_np = TensorBridge._to_numpy(XYZ)
+        A_np = TensorBridge._to_numpy(A)
+        M_np = TensorBridge._to_numpy(M)
         
         structures = []
         
@@ -46,6 +53,7 @@ class TensorBridge:
             except Exception as e:
                 # This happens if the model generates physically impossible geometry
                 # We return None, and the RewardCalculator will give it a penalty later.
+                # print(f"Structure generation failed: {e}")
                 structures.append(None)
                 
         return structures
@@ -54,6 +62,10 @@ class TensorBridge:
     def _single_to_structure(g, l_params, xyz, a, m):
         # 1. Reconstruct Lattice
         # l_params is [a, b, c, alpha, beta, gamma]
+        # Ensure positive lattice constants to avoid Pymatgen errors
+        if np.any(l_params[:3] <= 0.1):
+            raise ValueError("Lattice constants too small")
+            
         lattice = Lattice.from_parameters(*l_params)
         
         # 2. Filter Valid Atoms
@@ -75,6 +87,4 @@ class TensorBridge:
             raise ValueError("Empty structure generated")
             
         # 3. Create Structure
-        # We use the raw lattice and coords because the model has already 
-        # performed the symmetry projection in the XYZ step.
-        return Structure(lattice, species, coords)
+        # We use the raw lattice and co

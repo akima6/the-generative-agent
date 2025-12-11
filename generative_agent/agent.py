@@ -1,96 +1,219 @@
-# The Generative Agent/generative_agent/agent.py
-# A clean wrapper for the CrystalFormer generation script.
-
+# generative_agent/ppo_trainer/trainer.py
 import os
-import subprocess
-import pandas as pd
-import ast
-from pymatgen.core import Structure, Lattice, Element
+import sys
+import yaml
+import torch
+import torch.optim as optim
+import numpy as np
+import pickle
+import copy
 
-class GenerativeAgent:
-    """
-    A wrapper class for the CrystalFormer generative model. It uses a subprocess
-    to call the official main.py script for generating new crystal structures.
-    """
-    def __init__(self, project_root_dir: str, main_env_name: str):
-        """
-        Initializes the agent with necessary paths and environment names.
-        
-        Args:
-            project_root_dir (str): The absolute path to 'The Generative Agent'.
-            main_env_name (str): The name of the conda env where CrystalFormer is installed.
-        """
-        self.root_dir = project_root_dir
-        self.env_name = main_env_name
-        self.crystalformer_dir = os.path.join(self.root_dir, "CrystalFormer")
-        self.generator_script = os.path.join(self.crystalformer_dir, "main.py")
-        self.model_path = os.path.join(self.root_dir, "pretrained_model", "epoch_005500.pkl")
-        self.output_dir = os.path.join(self.root_dir, "pretrained_model")
+# --- SETUP PATHS ---
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(CURRENT_DIR))
+CRYSTALFORMER_DIR = os.path.join(PROJECT_ROOT, "CrystalFormer")
+sys.path.append(CRYSTALFORMER_DIR)
 
-    def propose(self, batch_size: int, space_group: int) -> list:
-        """
-        Generates a batch of new, unrelaxed crystal structures.
+# --- CRYSTALFORMER IMPORTS (Now using Rewritten Modules) ---
+from crystalformer.src.transformer import make_transformer
+from crystalformer.src.sample import sample_crystal
+from crystalformer.src.loss import make_loss_fn
+from crystalformer.src.lattice import norm_lattice
+from crystalformer.reinforce.ppo import make_ppo_loss_fn
+
+# --- LOCAL IMPORTS ---
+from reward import RewardCalculator
+from bridge import TensorBridge
+
+# --- CONFIGURATION ---
+CONFIG_PATH = os.path.join(PROJECT_ROOT, "pretrained_model", "config.yaml")
+CHECKPOINT_PATH = os.path.join(PROJECT_ROOT, "pretrained_model", "epoch_005500.pt")
+
+# Training Hyperparameters
+BATCH_SIZE = 4    
+PPO_EPOCHS = 2    
+NUM_ITERATIONS = 5 
+LR = 1e-5         
+CLIP_EPS = 0.2    
+BETA = 0.05       
+SPACE_GROUP = 225 # Fm-3m 
+TEMP = 1.0        # Sampling temperature
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def load_config_and_model():
+    """Loads the architecture config and the pretrained weights."""
+    print(f"Loading Config from {CONFIG_PATH}")
+    with open(CONFIG_PATH, 'r') as f:
+        config = yaml.safe_load(f)
+
+    print(f"Initializing PyTorch Model on {DEVICE}...")
+    
+    # Initialize Model
+    # Note: 'key' is ignored in PyTorch version but kept for signature compatibility if needed
+    transformer = make_transformer(
+        key=None,
+        Nf=config['Nf'], Kx=config['Kx'], Kl=config['Kl'], n_max=config['n_max'],
+        h0_size=config['h0_size'], num_layers=config['transformer_layers'],
+        num_heads=config['num_heads'], key_size=config['key_size'],
+        model_size=config['model_size'], embed_size=config['embed_size'],
+        atom_types=config['atom_types'], wyck_types=config['wyck_types'],
+        dropout_rate=config['dropout_rate']
+    ).to(DEVICE)
+    
+    # Load Weights
+    if os.path.exists(CHECKPOINT_PATH):
+        print(f"Loading Checkpoint from {CHECKPOINT_PATH}")
+        checkpoint = torch.load(CHECKPOINT_PATH, map_location=DEVICE)
+        if 'model_state_dict' in checkpoint:
+            transformer.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            transformer.load_state_dict(checkpoint)
+    else:
+        print(f"Warning: Checkpoint {CHECKPOINT_PATH} not found. Using random init.")
+
+    return config, transformer
+
+def main():
+    print("--- STARTING NOVAGEN DISCOVERY ENGINE (PHASE 2 - PYTORCH INTEGRATED) ---")
+    
+    # 1. INITIALIZATION
+    config, transformer = load_config_and_model()
+    
+    # Create Frozen Pretrain Model for KL calculation
+    transformer_pretrain = copy.deepcopy(transformer)
+    transformer_pretrain.eval()
+    for p in transformer_pretrain.parameters():
+        p.requires_grad = False
         
-        Args:
-            batch_size (int): The number of structures to generate.
-            space_group (int): The space group to use as a condition.
+    # Optimizer
+    optimizer = optim.Adam(transformer.parameters(), lr=LR)
+    
+    # Initialize Loss Functions
+    # make_loss_fn returns (loss_fn, logp_fn)
+    # We only need logp_fn for PPO, but loss_fn helper is useful.
+    # In PyTorch rewrite, make_loss_fn returns (loss_fn, logp_fn).
+    _, logp_fn = make_loss_fn(
+        config['n_max'], config['atom_types'], config['wyck_types'],
+        config['Kx'], config['Kl'], transformer
+    )
+    
+    # PPO Loss Factory
+    # make_ppo_loss_fn returns a function: ppo_loss_fn(model, x, old_logp, pretrain_logp, advantages)
+    ppo_loss_calc = make_ppo_loss_fn(logp_fn, CLIP_EPS, BETA)
+
+    # Initialize Judges
+    reward_calc = RewardCalculator()
+    
+    # Sampling Constants
+    # atom_mask and constraints logic handled inside sample_crystal or passed as None
+    atom_mask = torch.zeros((config['n_max'], config['atom_types']), device=DEVICE) 
+    # (Assuming simple mask or None)
+    
+    # Constraints: JAX version used jnp.arange. PyTorch version expects similar or None.
+    # If constraints[i] < i, it copies. 
+    # We pass None for unconstrained generation for now.
+    constraints = torch.arange(config['n_max'], device=DEVICE)
+
+    # Baseline
+    global_baseline = -3.0
+    
+    # 3. THE TRAINING LOOP
+    for it in range(NUM_ITERATIONS):
+        print(f"\n=== Iteration {it+1}/{NUM_ITERATIONS} ===")
+        
+        # --- STEP A: DREAMING (Sampling) ---
+        print("1. Sampling new crystals...")
+        
+        # Call the Rewritten sample_crystal
+        # Signature: sample_crystal(key, transformer, params, n_max, batchsize, ...)
+        # We pass None for key/params as PyTorch model has them.
+        with torch.no_grad():
+            XYZ, A, W, M, L_real = sample_crystal(
+                key=None,
+                transformer=transformer,
+                params=None,
+                n_max=config['n_max'],
+                batchsize=BATCH_SIZE,
+                atom_types=config['atom_types'],
+                wyck_types=config['wyck_types'],
+                Kx=config['Kx'],
+                Kl=config['Kl'],
+                g=SPACE_GROUP,
+                w_mask=None,
+                atom_mask=None, # pass atom_mask if strictly needed
+                top_p=1.0,      # nucleus sampling off
+                temperature=TEMP,
+                T1=TEMP,
+                constraints=constraints
+            )
+        
+        G = torch.full((BATCH_SIZE,), SPACE_GROUP, device=DEVICE)
+        
+        # --- STEP B: MEMORIZING (Log Probs) ---
+        # Normalize Lattice
+        L_norm = norm_lattice(G, W, L_real)
+        
+        # Calculate Old Log Probs (no grad)
+        with torch.no_grad():
+            lp_w, lp_xyz, lp_a, lp_l = logp_fn(
+                transformer, G, L_norm, XYZ, A, W, is_train=False
+            )
+            old_logp = lp_w + lp_xyz + lp_a + lp_l
             
-        Returns:
-            A list of unrelaxed pymatgen.Structure objects.
-        """
-        print(f"\n--- Agent: Proposing {batch_size} structures for space group {space_group} ---")
-        
-        output_csv_path = os.path.join(self.output_dir, f"output_{space_group}.csv")
-        
-        command = [
-            "conda", "run", "-n", self.env_name, "python",
-            self.generator_script,
-            "--optimizer", "none",
-            "--restore_path", self.model_path,
-            "--spacegroup", str(space_group),
-            "--num_samples", str(batch_size),
-            "--batchsize", str(batch_size),
-            "--temperature", "1.0"
-        ]
-        
-        try:
-            # We add the --quiet flag back in, as it's good practice. If it fails for you,
-            # you can remove it. The worker scripts are now robust enough to handle it.
-            command.insert(2, "--quiet")
-            subprocess.run(command, check=True, cwd=self.crystalformer_dir, capture_output=True, text=True)
-        except subprocess.CalledProcessError as e:
-            # If the --quiet flag fails, try again without it.
-            if "unrecognized arguments: --quiet" in e.stderr:
-                print("Warning: Your version of conda does not support '--quiet'. Retrying without it.")
-                command.pop(2)
-                subprocess.run(command, check=True, cwd=self.crystalformer_dir, capture_output=True, text=True)
-            else:
-                print(f"ERROR: Generation failed. Stderr:\n{e.stderr}")
-                return []
-        
-        print(f"Agent: Generation complete. Parsing results from {output_csv_path}")
-        return self._parse_output(output_csv_path)
+            # Pretrain Log Probs
+            pp_w, pp_xyz, pp_a, pp_l = logp_fn(
+                transformer_pretrain, G, L_norm, XYZ, A, W, is_train=False
+            )
+            pretrain_logp = pp_w + pp_xyz + pp_a + pp_l
 
-    def _parse_output(self, csv_path: str) -> list:
-        """Helper function to parse the generator's CSV output."""
-        if not os.path.exists(csv_path):
-            return []
+        # --- STEP C: REALITY CHECK (Reward) ---
+        print("2. Converting to Physical Structures...")
+        # TensorBridge expects Tensors, converts to CPU numpy
+        structures = TensorBridge.batch_to_structures(G, L_real, XYZ, A, M)
         
-        df = pd.read_csv(csv_path)
-        structures = []
-        for _, row in df.iterrows():
-            try:
-                l_params = ast.literal_eval(row['L'])
-                lattice = Lattice.from_parameters(*l_params)
-                
-                atom_numbers = ast.literal_eval(row['A'])
-                coords = ast.literal_eval(row['X'])
-                
-                valid_species = [Element.from_Z(z) for z, c in zip(atom_numbers, coords) if z > 0]
-                valid_coords = [c for z, c in zip(atom_numbers, coords) if z > 0]
-                
-                if valid_species:
-                    structures.append(Structure(lattice, valid_species, valid_coords))
-            except Exception:
-                continue # Skip rows that are malformed
-        return structures
+        valid_count = sum(1 for s in structures if s is not None)
+        print(f"   [DEBUG] Successfully built {valid_count}/{BATCH_SIZE} Pymatgen structures.")
+            
+        print("3. Calculating Rewards...")
+        rewards_list = reward_calc.get_rewards(structures)
+        rewards_tensor = torch.tensor(rewards_list, device=DEVICE, dtype=torch.float32)
+        
+        avg_reward = rewards_tensor.mean().item()
+        global_baseline = 0.9 * global_baseline + 0.1 * avg_reward 
+        advantages = rewards_tensor - global_baseline
+        
+        print(f"   > Batch Avg Reward: {avg_reward:.4f}")
+        print(f"   > Running Baseline: {global_baseline:.4f}")
+        
+        # --- STEP D: LEARNING (Update) ---
+        print("4. Updating Neural Network Weights...")
+        transformer.train()
+        
+        x_data = (G, L_norm, XYZ, A, W)
+        
+        for ppo_epoch in range(PPO_EPOCHS):
+            optimizer.zero_grad()
+            
+            # PPO Loss Calculation (Rewritten ppo.py)
+            # Returns: (loss, kl) where loss is negative objective (to be minimized)
+            loss, kl = ppo_loss_calc(transformer, x_data, old_logp, pretrain_logp, advantages)
+            
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(transformer.parameters(), 1.0)
+            optimizer.step()
+            
+            print(f"   [Epoch {ppo_epoch+1}] PPO Loss: {loss.item():.6f} | Drift(KL): {kl.item():.6f}")
+
+    # 4. SAVING
+    print("\nTraining Complete.")
+    save_path = os.path.join(PROJECT_ROOT, "pretrained_model", "finetuned_semiconductor.pt")
+    print(f"Saving new brain to: {save_path}")
+    torch.save({
+        'model_state_dict': transformer.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'config': config
+    }, save_path)
+
+if __name__ == "__main__":
+    main()

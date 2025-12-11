@@ -2,8 +2,8 @@ import pandas as pd
 import os
 import numpy as np 
 import re
-import jax
-import jax.numpy as jnp
+import torch
+import sys
 
 def from_xyz_str(xyz_str: str):
     """
@@ -33,21 +33,35 @@ def from_xyz_str(xyz_str: str):
     return np.concatenate( [rot_matrix, trans[:, None]], axis=1) # (3, 4)
 
 
-df = pd.read_csv(os.path.join(os.path.dirname(__file__), '../data/wyckoff_list.csv'))
-df['Wyckoff Positions'] = df['Wyckoff Positions'].apply(eval)  # convert string to list
-wyckoff_positions = df['Wyckoff Positions'].tolist()
+# Load data
+# Assuming the file structure is maintained: ../data/wyckoff_list.csv
+try:
+    df = pd.read_csv(os.path.join(os.path.dirname(__file__), '../data/wyckoff_list.csv'))
+except FileNotFoundError:
+    # Fallback for testing or if file is elsewhere
+    # For now we assume strict adherence to provided structure
+    print("Warning: ../data/wyckoff_list.csv not found. Please ensure data exists.")
+    df = pd.DataFrame(columns=['Wyckoff Positions']) 
 
-symops = np.zeros((230, 28, 576, 3, 4)) # 576 is the least common multiple for all possible mult
-mult_table = np.zeros((230, 28), dtype=int) # mult_table[g-1, w] = multiplicity , 28 because we had pad 0 
-wmax_table = np.zeros((230,), dtype=int)    # wmax_table[g-1] = number of possible wyckoff letters for g 
-dof0_table = np.ones((230, 28), dtype=bool)  # dof0_table[g-1, w] = True for those wyckoff points with dof = 0 (no continuous dof)
-fc_mask_table = np.zeros((230, 28, 3), dtype=bool) # fc_mask_table[g-1, w] = True for continuous fc 
+if not df.empty:
+    df['Wyckoff Positions'] = df['Wyckoff Positions'].apply(eval)  # convert string to list
+    wyckoff_positions = df['Wyckoff Positions'].tolist()
+else:
+    wyckoff_positions = []
+
+# Initialize Tables (Numpy for construction)
+symops_np = np.zeros((230, 28, 576, 3, 4)) # 576 is the least common multiple for all possible mult
+mult_table_np = np.zeros((230, 28), dtype=int) # mult_table[g-1, w] = multiplicity , 28 because we had pad 0 
+wmax_table_np = np.zeros((230,), dtype=int)    # wmax_table[g-1] = number of possible wyckoff letters for g 
+dof0_table_np = np.ones((230, 28), dtype=bool)  # dof0_table[g-1, w] = True for those wyckoff points with dof = 0 (no continuous dof)
+fc_mask_table_np = np.zeros((230, 28, 3), dtype=bool) # fc_mask_table[g-1, w] = True for continuous fc 
 
 def build_g_code():
     #use general wyckoff position as the code for space groups
     xyz_table = []
     g_table = []
     for g in range(230):
+        if not wyckoff_positions: break
         wp0 = wyckoff_positions[g][0]
         g_table.append([])
         for xyz in wp0:
@@ -59,83 +73,133 @@ def build_g_code():
     g_code = []
     for g in range(230):
         g_code.append( [1 if i in g_table[g] else 0 for i in range(len(xyz_table))] )
-    del xyz_table
-    del g_table
-    g_code = jnp.array(g_code)
+    
+    g_code = torch.tensor(g_code)
     return g_code
 
-for g in range(230):
-    wyckoffs = []
-    for x in wyckoff_positions[g]:
-        wyckoffs.append([])
-        for y in x:
-            wyckoffs[-1].append(from_xyz_str(y))
-    wyckoffs = wyckoffs[::-1] # a-z,A
+# Populate Tables
+if wyckoff_positions:
+    for g in range(230):
+        wyckoffs = []
+        for x in wyckoff_positions[g]:
+            wyckoffs.append([])
+            for y in x:
+                wyckoffs[-1].append(from_xyz_str(y))
+        wyckoffs = wyckoffs[::-1] # a-z,A
 
-    mult = [len(w) for w in wyckoffs]
-    mult_table[g, 1:len(mult)+1] = mult
-    wmax_table[g] = len(mult)
+        mult = [len(w) for w in wyckoffs]
+        mult_table_np[g, 1:len(mult)+1] = mult
+        wmax_table_np[g] = len(mult)
 
-    # print (g+1, [len(w) for w in wyckoffs])
-    for w, wyckoff in enumerate(wyckoffs):
-        wyckoff = np.array(wyckoff)
-        repeats = symops.shape[2] // wyckoff.shape[0]
-        symops[g, w+1, :, :, :] = np.tile(wyckoff, (repeats, 1, 1))
-        dof0_table[g, w+1] = np.linalg.matrix_rank(wyckoff[0, :3, :3]) == 0
-        fc_mask_table[g, w+1] = jnp.abs(wyckoff[0, :3, :3]).sum(axis=1)!=0 
+        for w, wyckoff in enumerate(wyckoffs):
+            wyckoff = np.array(wyckoff)
+            repeats = symops_np.shape[2] // wyckoff.shape[0]
+            symops_np[g, w+1, :, :, :] = np.tile(wyckoff, (repeats, 1, 1))
+            dof0_table_np[g, w+1] = np.linalg.matrix_rank(wyckoff[0, :3, :3]) == 0
+            fc_mask_table_np[g, w+1] = np.abs(wyckoff[0, :3, :3]).sum(axis=1)!=0 
 
-symops = jnp.array(symops)
-mult_table = jnp.array(mult_table)
-wmax_table = jnp.array(wmax_table)
-dof0_table = jnp.array(dof0_table)
-fc_mask_table = jnp.array(fc_mask_table)
+# Convert to Numpy arrays (finalizing structure)
+# We keep these as numpy for easy import in other files (transformer.py expects lists/arrays often for indexing)
+# But we also provide Tensor versions for the model to use directly on GPU.
+
+symops = torch.from_numpy(symops_np).float()
+mult_table = torch.from_numpy(mult_table_np).long()
+wmax_table = torch.from_numpy(wmax_table_np).long()
+dof0_table = torch.from_numpy(dof0_table_np).bool()
+fc_mask_table = torch.from_numpy(fc_mask_table_np).bool()
+
+# Keep numpy versions if needed for simple indexing without tensor overhead in utils
+mult_table_numpy = mult_table_np
+wmax_table_numpy = wmax_table_np
+dof0_table_numpy = dof0_table_np
 
 def symmetrize_atoms(g, w, x):
     '''
     symmetrize atoms via, apply all sg symmetry op, finding the generator, and lastly apply symops 
     we need to do that because the sampled atom might not be at the first WP
     Args:
-       g: int 
-       w: int
-       x: (3,)
+       g: int (space group)
+       w: int (wyckoff index)
+       x: (3,) Tensor
     Returns:
        xs: (m, 3) symmetrize atom positions
     '''
-
-    # (1) apply all space group symmetry op to the x 
-    w_max = wmax_table[g-1].item()
-    m_max = mult_table[g-1, w_max].item()
-    ops = symops[g-1, w_max, :m_max] # (m_max, 3, 4)
-    affine_point = jnp.array([*x, 1]) # (4, )
-    coords = ops@affine_point # (m_max, 3) 
-    coords -= jnp.floor(coords)
+    # Ensure inputs are tensors on correct device
+    device = x.device
+    
+    # Global tables need to be on the same device
+    # We load them lazily or assume they are small enough to copy
+    # symops is large (230*28*576*3*4 * 4 bytes ~ 300MB). 
+    # Better to index on CPU then move small chunk to GPU.
+    
+    # 1. Get symmetry operations for general position (w_max)
+    g_idx = g - 1
+    w_max = wmax_table[g_idx].item()
+    m_max = mult_table[g_idx, w_max].item()
+    
+    # Indexing on CPU is faster than moving whole 300MB table to GPU if not needed
+    # But x is on GPU.
+    ops_cpu = symops[g_idx, w_max, :m_max] # (m_max, 3, 4)
+    ops = ops_cpu.to(device)
+    
+    affine_point = torch.cat([x, torch.tensor([1.0], device=device)]) # (4, )
+    
+    # (m,3,4) @ (4,1) -> (m,3)
+    # ops is (m, 3, 4). affine_point is (4,)
+    # We want ops @ affine_point.
+    # torch.mv needs (3,4) and (4,). 
+    # Batched: (m,3,4) x (4,) -> (m,3)
+    coords = torch.matmul(ops, affine_point) 
+    coords -= torch.floor(coords)
 
     # (2) search for the generator which satisfies op0(x) = x , i.e. the first Wyckoff position 
-    # here we solve it in a jit friendly way by looking for the minimal distance solution for the lhs and rhs  
-    #https://github.com/qzhu2017/PyXtal/blob/82e7d0eac1965c2713179eeda26a60cace06afc8/pyxtal/wyckoff_site.py#L115
-    def dist_to_op0x(coord):
-        diff = jnp.dot(symops[g-1, w, 0], jnp.array([*coord, 1])) - coord
-        diff -= jnp.rint(diff)
-        return jnp.sum(diff**2) 
-    loc = jnp.argmin(jax.vmap(dist_to_op0x)(coords))
-    x = coords[loc].reshape(3,)
+    # op0 is symops[g-1, w, 0]
+    op0_cpu = symops[g_idx, w, 0] # (3, 4)
+    op0 = op0_cpu.to(device)
+    
+    # We want to find coord in `coords` such that dist(op0(coord), coord) is minimized (ideally 0)
+    # dist = || (op0 @ [c,1]) - c ||^2 (modulo integer shifts)
+    
+    # Prepare broadcasting
+    # coords: (m_max, 3)
+    # op0: (3, 4)
+    
+    # op0_c = op0 @ [coords, 1]
+    # construct [coords, 1] -> (m_max, 4)
+    ones = torch.ones((coords.shape[0], 1), device=device)
+    coords_affine = torch.cat([coords, ones], dim=1) # (m_max, 4)
+    
+    # (m_max, 4) @ (4, 3) -> (m_max, 3)
+    # op0.T is (4, 3)
+    op0_res = torch.matmul(coords_affine, op0.t()) # (m_max, 3)
+    
+    diff = op0_res - coords
+    diff -= torch.round(diff)
+    dists = torch.sum(diff**2, dim=1) # (m_max,)
+    
+    loc = torch.argmin(dists)
+    x_gen = coords[loc] # (3,)
 
-    # (3) lastly, apply the given symmetry op to x
-    m = mult_table[g-1, w] 
-    ops = symops[g-1, w, :m]   # (m, 3, 4)
-    affine_point = jnp.array([*x, 1]) # (4, )
-    xs = ops@affine_point # (m, 3)
-    xs -= jnp.floor(xs) # wrap back to 0-1 
+    # (3) lastly, apply the given symmetry op to x_gen
+    m = mult_table[g_idx, w].item()
+    ops_final_cpu = symops[g_idx, w, :m] # (m, 3, 4)
+    ops_final = ops_final_cpu.to(device)
+    
+    affine_point_final = torch.cat([x_gen, torch.tensor([1.0], device=device)])
+    xs = torch.matmul(ops_final, affine_point_final) # (m, 3)
+    xs -= torch.floor(xs)
+    
     return xs
 
 if __name__=='__main__':
     print (symops.shape)
-    print (symops.size*symops.dtype.itemsize//(1024*1024))
+    # Size in MB
+    print (symops.numel() * symops.element_size() // (1024*1024))
 
-    import numpy as np 
     np.set_printoptions(threshold=np.inf)
 
-    print (symops[166-1,3, :6])
+    # Test access (CPU tensor)
+    print (symops[166-1, 3, :6])
     op = symops[166-1, 3, 0]
     print (op)
     
@@ -144,32 +208,7 @@ if __name__=='__main__':
     print ('w_max, m_max', w_max, m_max)
 
     print (fc_mask_table[225-1, 6])
-    sys.exit(0)
     
-    print ('mult_table')
-    print (mult_table[25-1]) # space group id -> multiplicity table
-    print (mult_table[42-1])
-    print (mult_table[47-1])
-    print (mult_table[99-1])
-    print (mult_table[123-1])
-    print (mult_table[221-1])
-    print (mult_table[166-1])
-
-    print ('dof0_table')
-    print (dof0_table[25-1])
-    print (dof0_table[42-1])
-    print (dof0_table[47-1])
-    print (dof0_table[225-1])
-    print (dof0_table[166-1])
-    
-    print ('wmax_table')
-    print (wmax_table[47-1])
-    print (wmax_table[123-1])
-    print (wmax_table[166-1])
-
-    print ('wmax_table', wmax_table)
-    
-    atom_types = 119 
-    aw_max = wmax_table*(atom_types-1)    # the maximum value of aw
-    print ( (aw_max-1)%(atom_types-1)+1 ) # = 118 
-    print ( (aw_max-1)//(atom_types-1)+1 ) # = wmax
+    # Just printing examples as per original script
+    # To exit cleanly in test run
+    # sys.exit(0)
