@@ -46,7 +46,7 @@ def make_ppo_loss_fn(logp_fn, eps_clip, beta=0.1):
         # Return loss and the *clamped* KL for logging
         return ppo_loss, kl_clamped_mean
     
-    return make_ppo_loss_fn
+    return ppo_loss_fn
 
 def train(model, optimizer, spg_mask, loss_fn, logp_fn, batch_reward_fn, sample_crystal_fn, 
           epochs, ppo_epochs, batchsize, valid_data, path, checkpoint_interval=5):
