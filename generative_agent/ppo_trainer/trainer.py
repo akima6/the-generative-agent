@@ -22,9 +22,8 @@ from crystalformer.src.lattice import norm_lattice
 from crystalformer.reinforce.ppo import make_ppo_loss_fn
 
 # --- LOCAL IMPORTS ---
-from .reward import RewardCalculator
-from .bridge import TensorBridge
-
+from generative_agent.ppo_trainer.reward import RewardCalculator
+from generative_agent.ppo_trainer.bridge import TensorBridge
 # --- CONFIGURATION ---
 CONFIG_PATH = os.path.join(PROJECT_ROOT, "pretrained_model", "config.yaml")
 CHECKPOINT_PATH = os.path.join(PROJECT_ROOT, "pretrained_model", "epoch_005500.pt")
