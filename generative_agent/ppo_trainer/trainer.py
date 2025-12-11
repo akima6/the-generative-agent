@@ -10,12 +10,17 @@ import copy
 
 # --- SETUP PATHS ---
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, "../../.."))
 
+# crystalformer package lives here:
+# /content/the-generative-agent/CrystalFormer/crystalformer
 CRYSTALFORMER_DIR = os.path.join(PROJECT_ROOT, "CrystalFormer")
-sys.path.insert(0, PROJECT_ROOT)
 
-# --- CRYSTALFORMER IMPORTS (Now using Rewritten Modules) ---
+# Ensure both project root and CrystalFormer path are importable
+sys.path.insert(0, PROJECT_ROOT)
+sys.path.insert(0, CRYSTALFORMER_DIR)
+
+# --- CRYSTALFORMER IMPORTS ---
 from crystalformer.src.transformer import make_transformer
 from crystalformer.src.sample import sample_crystal
 from crystalformer.src.loss import make_loss_fn
@@ -24,7 +29,8 @@ from crystalformer.reinforce.ppo import make_ppo_loss_fn
 
 # --- LOCAL IMPORTS ---
 from generative_agent.ppo_trainer.reward import RewardCalculator
-from generative_agent.ppo_trainer.bridge import TensorBridge 
+from generative_agent.ppo_trainer.bridge import TensorBridge
+
 # --- CONFIGURATION ---
 CONFIG_PATH = os.path.join(PROJECT_ROOT, "pretrained_model", "config.yaml")
 CHECKPOINT_PATH = os.path.join(PROJECT_ROOT, "pretrained_model", "epoch_005500.pt")
