@@ -24,16 +24,6 @@ class TensorBridge:
     def batch_to_structures(G, L, XYZ, A, M):
         """
         Convert batch of PyTorch tensors to a list of Pymatgen Structures.
-        
-        Args:
-            G: Space group numbers (batch,)
-            L: Lattice parameters [a, b, c, alpha, beta, gamma] (batch, 6)
-            XYZ: Fractional coordinates (batch, n_max, 3)
-            A: Atom types (batch, n_max) - Integer Z numbers
-            M: Multiplicity (batch, n_max) - Used to filter padded atoms
-            
-        Returns:
-            List of valid pymatgen.Structure objects. None for failed conversions.
         """
         # Convert Torch tensors to standard Numpy arrays for CPU processing
         G_np = TensorBridge._to_numpy(G)
@@ -51,9 +41,10 @@ class TensorBridge:
                 )
                 structures.append(struct)
             except Exception as e:
-                # This happens if the model generates physically impossible geometry
-                # We return None, and the RewardCalculator will give it a penalty later.
-                # print(f"Structure generation failed: {e}")
+                # DEBUG PRINT: Print exactly why it failed
+                print(f"[Bridge Error Sample {i}] {e}")
+                # Print Lattice params to check for NaNs or Negatives
+                print(f"  Lattice: {L_np[i]}")
                 structures.append(None)
                 
         return structures
@@ -62,10 +53,19 @@ class TensorBridge:
     def _single_to_structure(g, l_params, xyz, a, m):
         # 1. Reconstruct Lattice
         # l_params is [a, b, c, alpha, beta, gamma]
-        # Ensure positive lattice constants to avoid Pymatgen errors
-        if np.any(l_params[:3] <= 0.1):
-            raise ValueError("Lattice constants too small")
+        
+        # Check for NaNs
+        if np.isnan(l_params).any():
+            raise ValueError("Lattice parameters contain NaNs")
             
+        # Check for non-positive lengths
+        if np.any(l_params[:3] <= 1e-3):
+            raise ValueError(f"Lattice lengths too small or negative: {l_params[:3]}")
+            
+        # Pymatgen validation for angles
+        if np.any(l_params[3:] <= 0) or np.any(l_params[3:] >= 180):
+             raise ValueError(f"Invalid Lattice Angles: {l_params[3:]}")
+
         lattice = Lattice.from_parameters(*l_params)
         
         # 2. Filter Valid Atoms
@@ -84,7 +84,7 @@ class TensorBridge:
                 coords.append(xyz[idx])
                 
         if len(species) == 0:
-            raise ValueError("Empty structure generated")
+            raise ValueError("Empty structure generated (No valid atoms)")
             
         # 3. Create Structure
-        # We use the raw lattice and co
+        return Structure(lattice, species, coords)
