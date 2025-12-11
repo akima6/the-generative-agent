@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 
 def main():
-    # FIX: Ensure all local imports work in the subprocess environment
+    # CRITICAL FIX: Ensure worker directory is in path for local imports (like relaxer.py)
     worker_dir = str(Path(os.path.abspath(__file__)).parent)
     if worker_dir not in sys.path:
         sys.path.append(worker_dir)
@@ -22,7 +22,7 @@ def main():
         import warnings
         warnings.filterwarnings("ignore")
         
-        # Import Relaxer (this will fail if matgl/ase are not installed)
+        # This is where the ImportError happened. matgl/ase/torch must be in path.
         from relaxer import Relaxer 
         
         if len(args) < 2:
@@ -33,6 +33,7 @@ def main():
         input_paths = args[1:]
         os.makedirs(output_dir, exist_ok=True)
 
+        # MatGL load happens inside Relaxer.__init__()
         relaxer = Relaxer()
 
         for fp in input_paths:
@@ -40,7 +41,6 @@ def main():
             try:
                 struct = Structure.from_file(fp)
                 
-                # --- SAFETY CHECK (Keep as is) ---
                 if struct.density < 0.1 or len(struct) < 2: 
                     info["error"] = "Structure too sparse or too few atoms"
                     results.append(info)
@@ -58,16 +58,13 @@ def main():
                 
                 results.append(info)
             except Exception as e:
-                # Catch per-structure errors
                 info["error"] = f"Relaxation failed with error: {str(e)}"
                 results.append(info)
 
     except Exception as e:
-        # Catastrophic failure catch for the whole script (ImportError)
-        # This will be printed to STDOUT, which the main script will try to parse
+        # Catastrophic failure catch for the whole script (The MatGL ImportError was caught here)
         results = [{"error": f"Worker crashed (Import/Setup): {str(e)}", "input_file": "N/A"}]
 
-    # The ONLY print to stdout. 
     print(json.dumps(results if results else []))
 
 if __name__ == "__main__":
