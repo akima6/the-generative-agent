@@ -22,69 +22,77 @@ def load_jax_weights(path):
     return params
 
 def jax_to_torch(param):
+    # Ensure it's a numpy array first
     return torch.tensor(np.array(param))
 
 def get_param(params, key, subkey):
     """Safely get param from dictionary."""
     if key not in params:
-        raise KeyError(f"Key '{key}' not found.")
-    if subkey not in params[key]:
-        raise KeyError(f"Subkey '{subkey}' not found in '{key}'. Available: {list(params[key].keys())}")
-    return jax_to_torch(params[key][subkey])
+        raise KeyError(f"Key '{key}' not found in checkpoint.")
+    val = params[key]
+    if subkey not in val:
+        raise KeyError(f"Subkey '{subkey}' not found in '{key}'. Available: {list(val.keys())}")
+    return jax_to_torch(val[subkey])
 
 def convert_weights(jax_params, torch_model):
-    print("Converting weights (Flat-Slash Structure)...")
+    print("Converting weights...")
     state_dict = torch_model.state_dict()
     
-    # --- 1. EMBEDDINGS (Under '~') ---
+    # --- 1. EMBEDDINGS ---
+    # Scope '~' contains the embeddings directly
     print("  - Converting Embeddings...")
     embeddings_scope = jax_params.get('~')
     if embeddings_scope is None:
-        print("Error: Scope '~' not found. Cannot load embeddings.")
+        print("Error: Scope '~' not found.")
         sys.exit(1)
 
-    state_dict['g_embeddings.weight'] = jax_to_torch(embeddings_scope['g_embeddings']['embeddings'])
-    state_dict['w_embeddings.weight'] = jax_to_torch(embeddings_scope['w_embeddings']['embeddings'])
-    state_dict['a_embeddings.weight'] = jax_to_torch(embeddings_scope['a_embeddings']['embeddings'])
+    # DIRECT ACCESS (No ['embeddings'] subkey)
+    state_dict['g_embeddings.weight'] = jax_to_torch(embeddings_scope['g_embeddings'])
+    state_dict['w_embeddings.weight'] = jax_to_torch(embeddings_scope['w_embeddings'])
+    state_dict['a_embeddings.weight'] = jax_to_torch(embeddings_scope['a_embeddings'])
 
-    # --- 2. PROJECTIONS (Linear Layers) ---
+    # --- 2. PROJECTIONS ---
     print("  - Converting Projections...")
     
-    # Check if w_params exists (h0 size 0) or h0_mlp exists
-    # Based on previous logs, we check keys inside '~' or top level 'linear' counts
+    # Check for h0 MLP vs Table
+    # If h0_size > 0, we expect linear_0 and linear_1 to be h0_mlp
+    # If not, w_params would be in embeddings_scope
+    
     if 'w_params' in embeddings_scope:
         print("    Found w_params (Table Lookup)")
-        state_dict['w_params'] = jax_to_torch(embeddings_scope['w_params']['w_params'])
+        state_dict['w_params'] = jax_to_torch(embeddings_scope['w_params'])
         linear_offset = 0
     else:
         print("    Found h0 MLP (Linear 0 & 1)")
         linear_offset = 2
 
-    def get_lin_weights(key_name):
-        return get_param(jax_params, key_name, 'w'), get_param(jax_params, key_name, 'b')
-
-    def load_linear_to_torch(jax_idx, torch_name):
+    # Helper to load linear layer
+    def load_linear(jax_idx, torch_name):
         suffix = f"_{jax_idx}" if jax_idx > 0 else ""
         key = f"linear{suffix}"
-        w, b = get_lin_weights(key)
+        w = get_param(jax_params, key, 'w')
+        b = get_param(jax_params, key, 'b')
         state_dict[f'{torch_name}.weight'] = w.t()
         state_dict[f'{torch_name}.bias'] = b
 
-    # Load h0 MLP if offset is 2
+    # Load h0 MLP
     if linear_offset == 2:
-        load_linear_to_torch(0, 'h0_mlp.0')
-        load_linear_to_torch(1, 'h0_mlp.2')
+        load_linear(0, 'h0_mlp.0')
+        load_linear(1, 'h0_mlp.2')
 
     # fc_hW
-    load_linear_to_torch(linear_offset + 0, 'fc_hW')
+    load_linear(linear_offset + 0, 'fc_hW')
     # fc_hA
-    load_linear_to_torch(linear_offset + 1, 'fc_hA')
+    load_linear(linear_offset + 1, 'fc_hA')
     
     # fc_hXYZ (Average next 3)
     idx_base = linear_offset + 2
-    w4, b4 = get_lin_weights(f"linear_{idx_base}")
-    w5, b5 = get_lin_weights(f"linear_{idx_base+1}")
-    w6, b6 = get_lin_weights(f"linear_{idx_base+2}")
+    w4 = get_param(jax_params, f"linear_{idx_base}", 'w')
+    w5 = get_param(jax_params, f"linear_{idx_base+1}", 'w')
+    w6 = get_param(jax_params, f"linear_{idx_base+2}", 'w')
+    b4 = get_param(jax_params, f"linear_{idx_base}", 'b')
+    b5 = get_param(jax_params, f"linear_{idx_base+1}", 'b')
+    b6 = get_param(jax_params, f"linear_{idx_base+2}", 'b')
     
     state_dict['fc_hXYZ.weight'] = ((w4+w5+w6)/3.0).t()
     state_dict['fc_hXYZ.bias'] = (b4+b5+b6)/3.0
@@ -108,19 +116,17 @@ def convert_weights(jax_params, torch_model):
         # MLP
         l1_idx = mlp_start_idx + 2*i
         l2_idx = mlp_start_idx + 2*i + 1
-        load_linear_to_torch(l1_idx, f'layers.{i}.mlp.0')
-        load_linear_to_torch(l2_idx, f'layers.{i}.mlp.2')
+        load_linear(l1_idx, f'layers.{i}.mlp.0')
+        load_linear(l2_idx, f'layers.{i}.mlp.2')
         
         # Attention
-        # Key format: "multi_head_attention" or "multi_head_attention_1"
+        # Construct flat keys: e.g. "multi_head_attention_1/query"
         attn_base = f"multi_head_attention_{i}" if i > 0 else "multi_head_attention"
         
-        # NOTE: Keys are like "multi_head_attention/query", NOT nested dicts
         def get_attn_param(submodule, param):
             full_key = f"{attn_base}/{submodule}"
             return get_param(jax_params, full_key, param)
 
-        # Q, K, V
         w_q = get_attn_param('query', 'w')
         w_k = get_attn_param('key', 'w')
         w_v = get_attn_param('value', 'w')
@@ -129,11 +135,9 @@ def convert_weights(jax_params, torch_model):
         b_k = get_attn_param('key', 'b')
         b_v = get_attn_param('value', 'b')
         
-        # Reshape Weights: (Embed, Heads, Dim) -> (Embed, Embed) -> Transpose
+        # Reshape: (Embed, Heads, Dim) -> (Embed, Embed) -> Transpose
         def to_pt(w): 
             return w.reshape(w.shape[0], -1).t()
-
-        # Reshape Bias: (Heads, Dim) -> (Embed)
         def to_pt_b(b):
             return b.reshape(-1)
         
@@ -154,7 +158,7 @@ def convert_weights(jax_params, torch_model):
     state_dict['final_norm.bias'] = get_param(jax_params, final_ln_key, 'offset')
     
     final_lin_idx = mlp_start_idx + 2*num_layers
-    load_linear_to_torch(final_lin_idx, 'output_proj')
+    load_linear(final_lin_idx, 'output_proj')
 
     print("Load state dict into model...")
     torch_model.load_state_dict(state_dict)
