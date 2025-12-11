@@ -4,13 +4,11 @@ import torch.nn.functional as F
 import numpy as np
 import math
 
-# We assume these tables will be available from the rewritten wyckoff.py
-# If wyckoff.py is not yet rewritten, these imports might fail until Phase 1 is complete.
 from crystalformer.src.wyckoff import wmax_table, dof0_table
 
 class TransformerBlock(nn.Module):
     """
-    Pre-LN Transformer Block to match Haiku's architecture:
+    Pre-LN Transformer Block.
     Norm -> Attention -> Add -> Norm -> MLP -> Add
     """
     def __init__(self, num_heads, key_size, model_size, dropout_rate=0.1, widening_factor=4):
@@ -19,20 +17,14 @@ class TransformerBlock(nn.Module):
         self.key_size = key_size
         self.model_size = model_size
         
-        # Layer Norms
         self.ln1 = nn.LayerNorm(model_size)
         self.ln2 = nn.LayerNorm(model_size)
 
-        # Multi-Head Attention
-        # Note: Haiku's KeySize usually implies per-head dimension. 
-        # PyTorch MHA usually takes embed_dim and num_heads.
-        # We assume model_size is the embedding dimension.
         self.attn = nn.MultiheadAttention(embed_dim=model_size, 
                                           num_heads=num_heads, 
                                           dropout=dropout_rate, 
                                           batch_first=True)
         
-        # MLP Block
         self.mlp = nn.Sequential(
             nn.Linear(model_size, widening_factor * model_size),
             nn.GELU(),
@@ -40,8 +32,6 @@ class TransformerBlock(nn.Module):
         )
         
         self.dropout = nn.Dropout(dropout_rate)
-        
-        # Initialization (Truncated Normal 0.01 to match original)
         self._init_weights()
 
     def _init_weights(self):
@@ -53,18 +43,10 @@ class TransformerBlock(nn.Module):
 
     def forward(self, x, mask=None, is_train=True):
         # x: (Batch, SeqLen, ModelSize)
-        
-        # Sub-layer 1: Attention
         h_norm = self.ln1(x)
         
-        # PyTorch MHA expects mask: (N*num_heads, L, S) or (L, S).
-        # The original passed a causal mask (1, 5*n, 5*n).
-        # We need to ensure the mask is boolean or -inf for MHA.
-        # If mask is 0/1 (1 for keep, 0 for mask), we need to invert for PyTorch usually
-        # but PyTorch `attn_mask` accepts float mask directly (0 for keep, -inf for mask)
-        # or boolean (True for mask, False for keep).
-        # Let's handle the mask passed from the main model.
-        
+        # attn_mask should be (SeqLen, SeqLen) or (Batch*NumHeads, SeqLen, SeqLen)
+        # We assume standard causal mask passed from main model
         attn_out, _ = self.attn(h_norm, h_norm, h_norm, attn_mask=mask, need_weights=False)
         
         if is_train:
@@ -72,7 +54,6 @@ class TransformerBlock(nn.Module):
         
         x = x + attn_out
 
-        # Sub-layer 2: MLP
         h_norm = self.ln2(x)
         mlp_out = self.mlp(h_norm)
         
@@ -109,7 +90,6 @@ class CrystalTransformer(nn.Module):
         self.w_embeddings = nn.Embedding(wyck_types, embed_size)
         self.a_embeddings = nn.Embedding(atom_types, embed_size)
         
-        # h0 Logic
         if h0_size > 0:
             self.h0_mlp = nn.Sequential(
                 nn.Linear(embed_size, h0_size),
@@ -119,22 +99,14 @@ class CrystalTransformer(nn.Module):
         else:
             self.w_params = nn.Parameter(torch.randn(230, wyck_types) * 0.01)
 
-        # Projections to model_size
-        # Input to these are concatenations of embeddings and features
-        # hW input: G_emb (emb) + W_emb (emb) + M (1) = 2*emb + 1
+        # Projections
+        # hW input: G(emb) + W(emb) + M(1)
         self.fc_hW = nn.Linear(2 * embed_size + 1, model_size)
-        
-        # hA input: G_emb (emb) + A_emb (emb) = 2*emb
+        # hA input: G(emb) + A(emb)
         self.fc_hA = nn.Linear(2 * embed_size, model_size)
-        
-        # hX, hY, hZ input: G_emb (emb) + Fourier (2*Nf)
+        # hXYZ input: G(emb) + Fourier(2*Nf)
         self.fc_hXYZ = nn.Linear(embed_size + 2 * Nf, model_size)
 
-        # Position embeddings (from commented out code in original, but unused? 
-        # Original: "h = h + positional_embeddings[:5*n, :]". 
-        # The line was commented out in the source provided. I will skip it to preserve "EXACT model behavior".)
-
-        # Transformer Layers
         self.layers = nn.ModuleList([
             TransformerBlock(num_heads, key_size, model_size, attn_dropout, widening_factor)
             for _ in range(num_layers)
@@ -153,274 +125,272 @@ class CrystalTransformer(nn.Module):
                     nn.init.zeros_(m.bias)
 
     def renormalize_coord(self, h_x):
-        # h_x: (n, output_size)
-        # We only care about the first coord_types dimensions
-        n = h_x.shape[0]
-        
-        # Slice
-        relevant = h_x[:, :self.coord_types]
+        # h_x: (Batch, n, output_size)
+        # Only process first coord_types dims
+        relevant = h_x[..., :self.coord_types]
         x_logit, x_loc, x_kappa = torch.split(relevant, [self.Kx, self.Kx, self.Kx], dim=-1)
         
-        # LogSoftmax for logits (equivalent to x - logsumexp(x))
-        x_logit = torch.log_softmax(x_logit, dim=1)
-        
-        # Softplus for kappa
+        x_logit = torch.log_softmax(x_logit, dim=-1)
         x_kappa = F.softplus(x_kappa)
         
-        # Concatenate back
-        # Padding zeros for the rest of output_size
-        padding = torch.zeros((n, self.output_size - self.coord_types), device=h_x.device)
-        
-        h_x_new = torch.cat([x_logit, x_loc, x_kappa, padding], dim=-1)
-        return h_x_new
+        padding = torch.zeros(h_x.shape[:-1] + (self.output_size - self.coord_types,), device=h_x.device)
+        return torch.cat([x_logit, x_loc, x_kappa, padding], dim=-1)
 
     def forward(self, G, XYZ, A, W, M, is_train=True):
         """
-        Args:
-            G: (Scalar) Space group ID (1-230). In Torch, usually passed as tensor (1,) or scalar.
-            XYZ: (n, 3) fractional coordinates
-            A: (n, )  element type 
-            W: (n, )  wyckoff position index
-            M: (n, )  multiplicities
-            is_train: bool 
+        Supports Batched Input.
+        G: (Batch,)
+        XYZ: (Batch, n, 3)
+        A: (Batch, n)
+        W: (Batch, n)
+        M: (Batch, n)
         """
-        
-        # Ensure inputs are tensors and on correct device
         device = self.g_embeddings.weight.device
+        
+        # Ensure inputs are tensors
         if not isinstance(G, torch.Tensor): G = torch.tensor(G, device=device)
         XYZ = XYZ.to(device)
         A = A.to(device)
         W = W.to(device)
         M = M.to(device)
 
-        assert XYZ.ndim == 2
-        assert XYZ.shape[0] == A.shape[0]
-        assert XYZ.shape[1] == 3
+        # Handle Batch Dimension logic
+        is_batched = XYZ.ndim == 3
+        if not is_batched:
+            # Add batch dim for internal processing
+            G = G.reshape(1)
+            XYZ = XYZ.unsqueeze(0)
+            A = A.unsqueeze(0)
+            W = W.unsqueeze(0)
+            M = M.unsqueeze(0)
+
+        batch_size = XYZ.shape[0]
+        n_atoms = XYZ.shape[1]
         
-        n = XYZ.shape[0]
-        
-        # Adjust G index (0-229)
         G_idx = G.long() - 1
+        g_emb = self.g_embeddings(G_idx) # (Batch, emb)
         
-        # 1. Initial h0 (Wyckoff logits for first atom)
-        g_emb = self.g_embeddings(G_idx) # (embed_size,)
-        
-        # Convert wmax_table to tensor
-        # wmax_table is imported. Assuming it's numpy or list.
-        w_max_val = torch.tensor(wmax_table[G_idx.item()], device=device)
-        
+        # --- 1. Compute h0 (First prediction) ---
+        # wmax table lookup
+        wmax_tensor = torch.tensor(wmax_table, device=device) # (230,)
+        w_max_val = wmax_tensor[G_idx] # (Batch,)
+
         if self.h0_size > 0:
-            w_logit = self.h0_mlp(g_emb) # (wyck_types,)
+            w_logit_0 = self.h0_mlp(g_emb) # (Batch, wyck_types)
         else:
-            w_logit = self.w_params[G_idx] # (wyck_types,)
+            w_logit_0 = self.w_params[G_idx] 
 
         # Masking h0
-        # (1) first atom not pad atom (index 0)
-        # (2) mask unavailable positions
-        w_range = torch.arange(self.wyck_types, device=device)
-        w_mask = (w_range > 0) & (w_range <= w_max_val)
+        w_range = torch.arange(self.wyck_types, device=device).unsqueeze(0) # (1, wyck)
+        # Broadcast w_max_val to (Batch, 1)
+        w_mask_0 = (w_range > 0) & (w_range <= w_max_val.unsqueeze(1))
         
-        # Apply mask: keep where true, else -1e10
-        w_logit = torch.where(w_mask, w_logit, w_logit - 1e10)
+        w_logit_0 = torch.where(w_mask_0, w_logit_0, w_logit_0 - 1e10)
+        w_logit_0 = torch.log_softmax(w_logit_0, dim=1)
         
-        # Normalization
-        w_logit = torch.log_softmax(w_logit, dim=0)
+        # h0 vector
+        h0 = torch.cat([
+            w_logit_0.unsqueeze(1), # (Batch, 1, wyck)
+            torch.zeros((batch_size, 1, self.output_size - self.wyck_types), device=device)
+        ], dim=-1) # (Batch, 1, output)
         
-        h0 = torch.cat([w_logit.unsqueeze(0), 
-                        torch.zeros((1, self.output_size - self.wyck_types), device=device)], dim=-1) # (1, output_size)
-        
-        if n == 0:
-            return h0
+        if n_atoms == 0:
+            return h0 if is_batched else h0.squeeze(0)
 
-        # 2. Sequence Construction
-        # Embeddings broadcasted
-        g_emb_expanded = g_emb.unsqueeze(0).expand(n, -1) # (n, embed_size)
+        # --- 2. Sequence Embedding ---
+        # Broadcast G_emb: (Batch, emb) -> (Batch, n, emb)
+        g_emb_exp = g_emb.unsqueeze(1).expand(-1, n_atoms, -1)
         
         # hW
-        w_emb = self.w_embeddings(W.long()) # (n, embed_size)
-        hW_in = torch.cat([g_emb_expanded, w_emb, M.float().unsqueeze(1)], dim=1) # (n, 2*emb + 1)
-        hW = self.fc_hW(hW_in) # (n, model_size)
+        w_emb = self.w_embeddings(W.long()) # (Batch, n, emb)
+        hW_in = torch.cat([g_emb_exp, w_emb, M.float().unsqueeze(-1)], dim=-1)
+        hW = self.fc_hW(hW_in) # (Batch, n, model)
 
         # hA
-        a_emb = self.a_embeddings(A.long()) # (n, embed_size)
-        hA_in = torch.cat([g_emb_expanded, a_emb], dim=1) # (n, 2*emb)
-        hA = self.fc_hA(hA_in) # (n, model_size)
-        
-        # hX, hY, hZ (Fourier features)
-        X, Y, Z = XYZ[:, 0], XYZ[:, 1], XYZ[:, 2] # (n,)
+        a_emb = self.a_embeddings(A.long())
+        hA_in = torch.cat([g_emb_exp, a_emb], dim=-1)
+        hA = self.fc_hA(hA_in)
+
+        # hXYZ (Fourier)
+        X, Y, Z = XYZ[:,:,0], XYZ[:,:,1], XYZ[:,:,2] # (Batch, n)
         
         def fourier_encode(coords, Nf):
-            # coords: (n,)
-            # output: (n, 2*Nf)
-            freqs = torch.arange(1, Nf+1, device=device).float() # (Nf,)
-            args = 2 * math.pi * coords.unsqueeze(1) * freqs.unsqueeze(0) # (n, Nf)
-            return torch.cat([torch.sin(args), torch.cos(args)], dim=1)
+            # coords: (Batch, n)
+            freqs = torch.arange(1, Nf+1, device=device).float()
+            # args: (Batch, n, 1) * (1, 1, Nf) -> (Batch, n, Nf)
+            args = 2 * math.pi * coords.unsqueeze(-1) * freqs.view(1, 1, -1)
+            return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
         
         hX_f = fourier_encode(X, self.Nf)
         hY_f = fourier_encode(Y, self.Nf)
         hZ_f = fourier_encode(Z, self.Nf)
         
-        hX = self.fc_hXYZ(torch.cat([g_emb_expanded, hX_f], dim=1))
-        hY = self.fc_hXYZ(torch.cat([g_emb_expanded, hY_f], dim=1))
-        hZ = self.fc_hXYZ(torch.cat([g_emb_expanded, hZ_f], dim=1))
+        hX = self.fc_hXYZ(torch.cat([g_emb_exp, hX_f], dim=-1))
+        hY = self.fc_hXYZ(torch.cat([g_emb_exp, hY_f], dim=-1))
+        hZ = self.fc_hXYZ(torch.cat([g_emb_exp, hZ_f], dim=-1))
         
-        # Interleave: [hW, hA, hX, hY, hZ] per atom
-        # Stack dim 1 -> (n, 5, model_size)
-        h = torch.stack([hW, hA, hX, hY, hZ], dim=1)
-        h = h.reshape(5 * n, self.model_size) # (5*n, model_size)
+        # --- 3. Interleave ---
+        # Stack: (Batch, n, 5, model)
+        h = torch.stack([hW, hA, hX, hY, hZ], dim=2)
+        h = h.reshape(batch_size, 5 * n_atoms, self.model_size)
         
-        # Prepare for Transformer
-        # Batch dimension = 1
-        h = h.unsqueeze(0) # (1, 5*n, model_size)
+        # --- 4. Transformer Attention ---
+        seq_len = 5 * n_atoms
+        # Causal Mask
+        # (Seq, Seq) - same for all batches
+        mask = torch.triu(torch.ones(seq_len, seq_len, device=device), diagonal=1).bool()
+        # PyTorch `attn_mask`: True positions are ignored (masked out).
+        # We want to mask future positions (triu).
         
-        # Mask for attention (Causal / Tril)
-        # Original: jnp.tril(jnp.ones((1, 5*n, 5*n)))
-        # PyTorch attn_mask: (L, L) or (Batch*Heads, L, L). 
-        # Using float mask: 0.0 for include, -inf for exclude.
-        # Or boolean: True to key_padding_mask (ignore), but attn_mask meaning depends on version.
-        # We use standard causal mask logic:
-        # We want position i to attend to 0..i.
-        seq_len = 5 * n
-        causal_mask = torch.tril(torch.ones((seq_len, seq_len), device=device))
-        # Invert for PyTorch floating point mask: 0 for keep, -inf for mask
-        attn_mask = torch.zeros((seq_len, seq_len), device=device)
-        attn_mask = attn_mask.masked_fill(causal_mask == 0, float('-inf'))
+        # If is_train=False (generation), we can cache, but standard implementation handles it.
+        # Actually standard nn.MHA takes float/bool mask. 
+        # Float: -inf for mask, 0 for keep.
+        # Bool: True for mask, False for keep.
         
-        # 3. Transformer Loop
+        float_mask = torch.zeros(seq_len, seq_len, device=device)
+        float_mask = float_mask.masked_fill(mask, float('-inf'))
+        
         for layer in self.layers:
-            h = layer(h, mask=attn_mask, is_train=is_train)
+            h = layer(h, mask=float_mask, is_train=is_train)
             
         h = self.final_norm(h)
-        h = self.output_proj(h) # (1, 5*n, output_size)
+        h = self.output_proj(h) # (Batch, 5*n, output)
         
-        h = h.squeeze(0).reshape(n, 5, -1) # (n, 5, output_size)
+        # --- 5. Unpack and Process Outputs ---
+        h = h.reshape(batch_size, n_atoms, 5, -1)
         
-        # Unpack
-        h_al = h[:, 0, :]
-        h_x = h[:, 1, :]
-        h_y = h[:, 2, :]
-        h_z = h[:, 3, :]
-        w_logit_seq = h[:, 4, :] # Rename to avoid confusion with h0 w_logit
+        h_al = h[:, :, 0, :]
+        h_x = h[:, :, 1, :]
+        h_y = h[:, :, 2, :]
+        h_z = h[:, :, 3, :]
+        w_logit_seq = h[:, :, 4, :]
         
-        # 4. Post-processing & Renormalization
+        # Renormalize Coords
         h_x = self.renormalize_coord(h_x)
         h_y = self.renormalize_coord(h_y)
         h_z = self.renormalize_coord(h_z)
         
-        # Extract logits
-        a_logit = h_al[:, :self.atom_types]
-        w_logit_step = w_logit_seq[:, :self.wyck_types]
+        # Logits
+        a_logit = h_al[..., :self.atom_types]
+        w_logit = w_logit_seq[..., :self.wyck_types]
         
-        # --- Masking Logic ---
-        # (1) W_0 <= W_1 <= W_2 constraints
-        # W is (n,). 
-        # w_mask_less_equal: (n, wyck_types-1)
-        w_idx = torch.arange(1, self.wyck_types, device=device).unsqueeze(0) # (1, wyck-1)
-        W_uns = W.unsqueeze(1) # (n, 1)
+        # --- Masking Logic (Batched) ---
         
-        mask_less_equal = w_idx < W_uns
-        mask_less = w_idx <= W_uns
+        # (1) W constraints: W_0 <= W_1 ...
+        # W: (Batch, n)
+        # w_range: (1, 1, wyck-1)
+        w_range = torch.arange(1, self.wyck_types, device=device).view(1, 1, -1)
+        W_uns = W.unsqueeze(-1) # (Batch, n, 1)
         
-        # dof0_table: (230, wyck_types) -> boolean
-        # Select for current G and W
-        # dof0_table is (230, max_wyck).
-        # We need dof0_table[G-1, W]. W is (n,).
-        # Need to cast table to tensor first if not already
-        dof0_tensor = torch.tensor(dof0_table, device=device) # (230, wyck_types)
-        is_dof0 = dof0_tensor[G_idx, W.long()] # (n,)
+        mask_less_equal = w_range < W_uns
+        mask_less = w_range <= W_uns
         
-        w_mask_1 = torch.where(is_dof0.unsqueeze(1), mask_less, mask_less_equal) # (n, wyck-1)
+        # dof0 lookup
+        dof0_gpu = torch.tensor(dof0_table, device=device) # (230, wyck)
+        # Gather dof0 for current W
+        # W indices: (Batch, n)
+        # G indices: (Batch, 1) -> (Batch, n)
+        G_exp = G_idx.unsqueeze(1).expand(-1, n_atoms)
+        is_dof0 = dof0_gpu[G_exp, W.long()] # (Batch, n)
         
-        # Prepend zeros column (pad for index 0)
-        w_mask_1 = torch.cat([torch.zeros((n, 1), device=device, dtype=torch.bool), w_mask_1], dim=1) # (n, wyck)
+        # Select mask
+        # is_dof0: (Batch, n) -> (Batch, n, 1)
+        w_mask_1 = torch.where(is_dof0.unsqueeze(-1), mask_less, mask_less_equal)
+        # Pad column 0
+        pad_col = torch.zeros(batch_size, n_atoms, 1, device=device, dtype=torch.bool)
+        w_mask_1 = torch.cat([pad_col, w_mask_1], dim=-1)
         
-        w_logit_step = w_logit_step - torch.where(w_mask_1, torch.tensor(1e10, device=device), torch.tensor(0.0, device=device))
-        w_logit_step = torch.log_softmax(w_logit_step, dim=1)
+        w_logit = w_logit - torch.where(w_mask_1, torch.tensor(1e10, device=device), torch.tensor(0.0, device=device))
+        w_logit = torch.log_softmax(w_logit, dim=-1)
         
-        # (2) Pad atom logic (if W==0, enhance prob of pad)
-        # mask = 1 where we want to place pad atoms (if prev W==0)
-        pad_cond = (W == 0).unsqueeze(1) # (n, 1)
+        # (2) Pad Atom Logic
+        # W==0 means pad. If W==0, we force W_next=0 (pad) usually?
+        # Original: "enhance prob of pad atoms if there is already a type 0 atom"
+        # Logic: If W[i] == 0, then we heavily prefer pad for W[i] prediction?
+        # Actually original says: "mask = 1 for those locations to place pad atoms of type 0".
+        # If W==0, mask is 1 at index 0, 0 elsewhere.
+        # Then: w_logit = where(mask, 1e10, w_logit). -> Set index 0 to high prob.
+        pad_cond = (W == 0).unsqueeze(-1) # (Batch, n, 1)
         w_mask_2 = torch.cat([
-            torch.where(pad_cond, torch.ones((n, 1), device=device), torch.zeros((n, 1), device=device)),
-            torch.zeros((n, self.wyck_types - 1), device=device)
-        ], dim=1).bool()
+            torch.ones(batch_size, n_atoms, 1, device=device),
+            torch.zeros(batch_size, n_atoms, self.wyck_types-1, device=device)
+        ], dim=-1).bool()
         
-        # If mask is True, we set logit to 1e10 ?? 
-        # Original: jnp.where(w_mask, 1e10, w_logit). 
-        # Wait, original says: "enhance the probability of pad atoms".
-        # If w_mask is 1 (pad atom pos), set to 1e10 (very high prob).
-        w_logit_step = torch.where(w_mask_2, torch.tensor(1e10, device=device), w_logit_step)
-        w_logit_step = torch.log_softmax(w_logit_step, dim=1)
+        # Apply only where pad_cond is true
+        # If pad_cond is True (W=0), we want w_logit[0] to be huge, others small.
+        # Original: where(w_mask, 1e10, w_logit).
+        # This makes index 0 -> 1e10. 
+        # But only if W=0.
         
-        # (3) Mask out unavailable positions > w_max
-        w_indices = torch.arange(self.wyck_types, device=device).unsqueeze(0) # (1, wyck)
-        w_mask_3 = w_indices <= w_max_val
-        w_logit_step = torch.where(w_mask_3, w_logit_step, w_logit_step - 1e10)
-        w_logit_step = torch.log_softmax(w_logit_step, dim=1)
+        # Let's just add 1e10 to index 0 if W=0.
+        w_logit[..., 0] = torch.where(W==0, w_logit[..., 0] + 1e10, w_logit[..., 0])
+        w_logit = torch.log_softmax(w_logit, dim=-1)
+        
+        # (3) w_max constraint
+        # w_max_val: (Batch,) -> (Batch, 1, 1)
+        w_indices = torch.arange(self.wyck_types, device=device).view(1, 1, -1)
+        w_mask_3 = w_indices <= w_max_val.view(-1, 1, 1)
+        w_logit = torch.where(w_mask_3, w_logit, w_logit - 1e10)
+        w_logit = torch.log_softmax(w_logit, dim=-1)
         
         # (4) Atom Masking
-        # If W > 0, mask out pad atom (type 0).
+        # If W > 0, mask out pad (type 0).
         # If W == 0, mask out true atoms (type > 0).
+        # mask[0] is (W>0). mask[1:] is (W==0).
+        w_gt_0 = (W > 0).unsqueeze(-1)
+        w_eq_0 = (W == 0).unsqueeze(-1)
+        
         a_mask = torch.cat([
-            (W > 0).unsqueeze(1), # Column 0
-            (W == 0).unsqueeze(1).repeat(1, self.atom_types - 1) # Columns 1..end
-        ], dim=1)
+            w_gt_0,
+            w_eq_0.repeat(1, 1, self.atom_types - 1)
+        ], dim=-1)
         
-        a_logit = a_logit + torch.where(a_mask, torch.tensor(-1e10, device=device), torch.tensor(0.0, device=device))
-        a_logit = torch.log_softmax(a_logit, dim=1)
+        a_logit = a_logit - torch.where(a_mask, torch.tensor(1e10, device=device), torch.tensor(0.0, device=device))
+        a_logit = torch.log_softmax(a_logit, dim=-1)
         
-        # Re-assemble w_logit
-        w_logit_step = torch.cat([w_logit_step, 
-                                  torch.zeros((n, self.output_size - self.wyck_types), device=device)], dim=-1)
+        # Re-assemble w_logit full
+        w_logit_final = torch.cat([
+            w_logit,
+            torch.zeros(batch_size, n_atoms, self.output_size - self.wyck_types, device=device)
+        ], dim=-1)
         
-        # Lattice parts
-        lattice_part = h_al[:, self.atom_types : self.atom_types + self.lattice_types]
-        l_logit, mu, sigma = torch.split(lattice_part, 
-                                         [self.Kl, self.Kl * 6, self.Kl * 6], dim=-1) # Assuming sigma is same size as mu?
-        # Original logic: split into [Kl, Kl+Kl*6] ?? 
-        # JAX: split(..., [Kl, Kl+Kl*6], axis=-1).
-        # Indices: 0..Kl (l_logit), Kl..Kl+6*Kl (mu), Kl+6*Kl..end (sigma).
-        # So sizes are: Kl, 6*Kl, remaining. 
-        # Total lattice_types = Kl + 2*6*Kl = Kl + 12*Kl = 13*Kl.
-        # So split sizes are Kl, 6*Kl, 6*Kl. Correct.
+        # Lattice Parts (Batch, n, output)
+        l_part = h_al[..., self.atom_types : self.atom_types + self.lattice_types]
+        l_logit, mu, sigma = torch.split(l_part, [self.Kl, 6*self.Kl, 6*self.Kl], dim=-1)
         
-        l_logit = torch.log_softmax(l_logit, dim=1)
+        l_logit = torch.log_softmax(l_logit, dim=-1)
         sigma = F.softplus(sigma) + self.sigmamin
         
         h_al_final = torch.cat([
-            a_logit, 
-            l_logit, 
-            mu, 
+            a_logit,
+            l_logit,
+            mu,
             sigma,
-            torch.zeros((n, self.output_size - self.atom_types - self.lattice_types), device=device)
+            torch.zeros(batch_size, n_atoms, self.output_size - self.atom_types - self.lattice_types, device=device)
         ], dim=-1)
         
-        # 5. Final Assembly
-        # Stack: (n, 5, output_size)
-        # Components: h_al, h_x, h_y, h_z, w_logit
+        # Final Stack
         h_final = torch.stack([
             h_al_final,
             h_x,
             h_y,
             h_z,
-            w_logit_step
-        ], dim=1)
+            w_logit_final
+        ], dim=2) # (Batch, n, 5, output)
         
-        h_final = h_final.reshape(5 * n, self.output_size)
+        h_final = h_final.reshape(batch_size, 5*n_atoms, self.output_size)
         
-        # Concatenate h0
-        result = torch.cat([h0, h_final], dim=0) # (5*n + 1, output_size)
+        # Concatenate h0 at seq dim
+        result = torch.cat([h0, h_final], dim=1) # (Batch, 5*n+1, output)
         
+        if not is_batched:
+            return result.squeeze(0)
+            
         return result
 
 def make_transformer(key, Nf, Kx, Kl, n_max, h0_size, num_layers, num_heads, key_size, 
                      model_size, embed_size, atom_types, wyck_types, dropout_rate, 
                      attn_dropout=0.1, widening_factor=4, sigmamin=1e-3):
-    """
-    Factory function to match the original interface partially.
-    Ignores 'key' as PyTorch is stateful.
-    Returns an instance of CrystalTransformer.
-    """
     return CrystalTransformer(
         Nf=Nf, Kx=Kx, Kl=Kl, n_max=n_max, h0_size=h0_size, 
         num_layers=num_layers, num_heads=num_heads, key_size=key_size, 
