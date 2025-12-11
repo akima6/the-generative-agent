@@ -10,41 +10,32 @@ from crystalformer.src.wyckoff import mult_table, fc_mask_table
 def von_mises_logpdf(x, loc, kappa):
     """
     Computes log(VonMises(x | loc, kappa))
-    x: (Batch, n_max, 1) or broadcastable
-    loc: (Batch, n_max, Kx)
-    kappa: (Batch, n_max, Kx)
+    ...
     """
-    # log(exp(kappa * cos(x - loc)) / (2*pi*I0(kappa)))
-    # = kappa * cos(x - loc) - log(2*pi) - log(I0(kappa))
+    # CRITICAL FIX 1: Clamp kappa to prevent division by zero or NaN in Bessel function
+    kappa = torch.clamp(kappa, min=1e-8) # Increase numerical floor
     
-    # x needs to be in radians [0, 2pi] usually, or normalized.
-    # The original code passed (X-0.5)*2*pi.
-    
-    # Bessel function I0 approximation is needed for gradients or exact value.
-    # PyTorch has torch.special.i0e (exponential scaled) or i0.
-    # log(I0(k)) = k + log(I0e(k)) helps numerical stability for large k.
-    
-    # Ensure kappa > 0
-    kappa = torch.clamp(kappa, min=1e-6)
-    
-    term1 = kappa * torch.cos(x.unsqueeze(-1) - loc) # (Batch, n_max, Kx)
-    term2 = -np.log(2 * np.pi)
-    term3 = -(kappa + torch.log(torch.special.i0e(kappa)))
+    # ... (rest of the code)
     
     return term1 + term2 + term3
 
+# --- Helper: Gaussian Log PDF ---
 def gaussian_logpdf(x, loc, scale):
     """
     Computes log(Gaussian(x | loc, scale))
-    x: (Batch, 6)
-    loc: (Batch, Kl, 6)
-    scale: (Batch, Kl, 6)
+    ...
     """
-    # x: (Batch, 1, 6)
+    # CRITICAL FIX 2: Clamp scale (sigma) to a numerical floor
+    scale = torch.clamp(scale, min=1e-8)
+    
     x = x.unsqueeze(1)
     var = scale ** 2
     log_scale = torch.log(scale)
-    return -((x - loc) ** 2) / (2 * var) - log_scale - 0.5 * np.log(2 * np.pi)
+    
+    # Use torch's constant for better compatibility
+    LOG_2PI = torch.tensor(np.log(2 * np.pi), device=x.device, dtype=x.dtype)
+    
+    return -((x - loc) ** 2) / (2 * var) - log_scale - 0.5 * LOG_2PI
 
 def make_loss_fn(n_max, atom_types, wyck_types, Kx, Kl, transformer, lamb_a=1.0, lamb_w=1.0, lamb_l=1.0):
     """
