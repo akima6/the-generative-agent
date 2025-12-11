@@ -10,7 +10,8 @@ import copy
 
 # --- SETUP PATHS ---
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, "../../.."))
+PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, "../../../"))
+
 
 # crystalformer package lives here:
 # /content/the-generative-agent/CrystalFormer/crystalformer
