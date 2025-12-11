@@ -4,9 +4,10 @@ import yaml
 import pickle
 import torch
 import numpy as np
+# We need JAX only to unpickle the arrays (Colab has JAX installed by default)
+# If the pickle contains JAX DeviceArrays, we need jax loaded to deserialize them.
 import jax
 import jax.numpy as jnp
-import haiku as hk
 
 # Setup paths
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -17,13 +18,22 @@ from crystalformer.src.transformer import make_transformer
 
 def load_jax_weights(path):
     print(f"Loading JAX weights from {path}...")
-    with open(path, 'rb') as f:
-        data = pickle.load(f)
+    # We use jax.default_backend() to ensure JAX is initialized for unpickling
+    try:
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+    except ModuleNotFoundError as e:
+        # Fallback: specific handling if some specific module is missing in unpickling
+        print(f"Error unpickling: {e}")
+        print("Note: If the checkpoint contains custom Haiku classes, you might need to 'pip install dm-haiku' temporarily.")
+        sys.exit(1)
+        
     # Handle if it's a dict with 'params' key or just params
     params = data['params'] if 'params' in data else data
     return params
 
 def jax_to_torch(param):
+    # Convert JAX array to Numpy, then to Torch
     return torch.tensor(np.array(param))
 
 def convert_weights(jax_params, torch_model):
@@ -32,10 +42,8 @@ def convert_weights(jax_params, torch_model):
     
     # Helper to clean Haiku names
     # Haiku structure: {'module_name': {'param_name': array}}
-    # We flatten this to mapping.
     
     # 1. Embeddings
-    # JAX: 'network/~/g_embeddings' -> 'embeddings'
     state_dict['g_embeddings.weight'] = jax_to_torch(jax_params['network/~/g_embeddings']['embeddings'])
     state_dict['w_embeddings.weight'] = jax_to_torch(jax_params['network/~/w_embeddings']['embeddings'])
     state_dict['a_embeddings.weight'] = jax_to_torch(jax_params['network/~/a_embeddings']['embeddings'])
@@ -45,9 +53,6 @@ def convert_weights(jax_params, torch_model):
         state_dict['w_params'] = jax_to_torch(jax_params['network/~/w_params']['w_params'])
     
     # 2. Projections
-    # Note: Haiku names Linear layers sequentially if not named. 
-    # Based on transformer.py order: hW (linear), hA (linear_1), hX (linear_2), hY (linear_3), hZ (linear_4)
-    
     def copy_linear(jax_name, torch_name):
         w = jax_params[f'network/~/{jax_name}']['w']
         b = jax_params[f'network/~/{jax_name}']['b']
@@ -61,8 +66,6 @@ def convert_weights(jax_params, torch_model):
     copy_linear('linear_1', 'fc_hA')
     
     # fc_hXYZ
-    # In JAX, X, Y, Z were separate layers (linear_2, linear_3, linear_4).
-    # In PyTorch, we combined them. We will average the weights to initialize.
     w2 = jax_to_torch(jax_params['network/~/linear_2']['w'])
     w3 = jax_to_torch(jax_params['network/~/linear_3']['w'])
     w4 = jax_to_torch(jax_params['network/~/linear_4']['w'])
@@ -79,26 +82,6 @@ def convert_weights(jax_params, torch_model):
     state_dict['fc_hXYZ.bias'] = b_avg
 
     # 3. Transformer Layers
-    # Haiku names: network/~/multi_head_attention, network/~/layer_norm, etc.
-    # Instances are suffixed: _1, _2...
-    
-    # Logic: Loop through layers 0 to num_layers-1
-    # Each block has:
-    #   ln1 (LayerNorm)
-    #   attn (MultiHeadAttention)
-    #   ln2 (LayerNorm)
-    #   mlp (Linear -> GELU -> Linear)
-    
-    # We need to count indices globally for Haiku names.
-    # Counts based on `network` structure in original JAX:
-    # 5 linears (0-4) used for projections.
-    # Then loop num_layers:
-    #   MHA (idx i)
-    #   LayerNorm (idx 2*i)
-    #   LayerNorm (idx 2*i + 1)
-    #   Linear (idx 5 + 2*i) -> MLP 1
-    #   Linear (idx 5 + 2*i + 1) -> MLP 2
-    
     num_layers = len(torch_model.layers)
     
     for i in range(num_layers):
@@ -117,7 +100,6 @@ def convert_weights(jax_params, torch_model):
         state_dict[f'layers.{i}.ln2.bias'] = jax_to_torch(jax_params[f'network/~/layer_norm{ln_suffix_2}']['offset'])
         
         # MLP
-        # Indices start after the first 5 linears
         mlp1_idx = 5 + 2 * i
         mlp2_idx = 5 + 2 * i + 1
         
@@ -134,86 +116,14 @@ def convert_weights(jax_params, torch_model):
         state_dict[f'layers.{i}.mlp.2.bias'] = b2
         
         # Attention
-        # Haiku: multi_head_attention_i
         attn_suffix = f"_{i}" if i > 0 else ""
         jax_attn = jax_params[f'network/~/multi_head_attention{attn_suffix}']
         
-        # JAX MHA: query, key, value, linear
-        # PyTorch MHA: in_proj_weight (cat Q,K,V), out_proj
-        
-        # Q, K, V weights in Haiku are (Embed, Heads, HeadDim)
-        # PyTorch expects (3*Embed, Embed) flattened
-        
         def to_pt_attn(w):
-            # JAX: (Embed, Heads, HeadDim) -> PyTorch: (Embed, Embed) but transposed?
-            # PyTorch linear weight is (Out, In).
-            # JAX is (In, Out).
-            # Reshape JAX: (E, H*D) -> (E, E)
             return jax_to_torch(w.reshape(w.shape[0], -1)).t()
 
         w_q = to_pt_attn(jax_attn['query']['w'])
         w_k = to_pt_attn(jax_attn['key']['w'])
         w_v = to_pt_attn(jax_attn['value']['w'])
         
-        b_q = jax_to_torch(jax_attn['query']['b'].reshape(-1))
-        b_k = jax_to_torch(jax_attn['key']['b'].reshape(-1))
-        b_v = jax_to_torch(jax_attn['value']['b'].reshape(-1))
-        
-        # Stack for in_proj
-        state_dict[f'layers.{i}.attn.in_proj_weight'] = torch.cat([w_q, w_k, w_v], dim=0)
-        state_dict[f'layers.{i}.attn.in_proj_bias'] = torch.cat([b_q, b_k, b_v], dim=0)
-        
-        # Output proj
-        w_o = jax_to_torch(jax_attn['linear']['w']).t() # (Out, In)
-        b_o = jax_to_torch(jax_attn['linear']['b'])
-        
-        state_dict[f'layers.{i}.attn.out_proj.weight'] = w_o
-        state_dict[f'layers.{i}.attn.out_proj.bias'] = b_o
-
-    # 4. Final Layers
-    # final_norm -> layer_norm_{last}
-    final_ln_idx = 2 * num_layers
-    state_dict['final_norm.weight'] = jax_to_torch(jax_params[f'network/~/layer_norm_{final_ln_idx}']['scale'])
-    state_dict['final_norm.bias'] = jax_to_torch(jax_params[f'network/~/layer_norm_{final_ln_idx}']['offset'])
-    
-    # output_proj -> linear_{last}
-    final_lin_idx = 5 + 2 * num_layers
-    state_dict['output_proj.weight'] = jax_to_torch(jax_params[f'network/~/linear_{final_lin_idx}']['w']).t()
-    state_dict['output_proj.bias'] = jax_to_torch(jax_params[f'network/~/linear_{final_lin_idx}']['b'])
-
-    print("Load state dict into model...")
-    torch_model.load_state_dict(state_dict)
-    print("Success!")
-    return torch_model
-
-def main():
-    # Config
-    config_path = os.path.join(CURRENT_DIR, "pretrained_model", "config.yaml")
-    with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
-        
-    # Initialize Torch Model
-    model = make_transformer(
-        key=None,
-        Nf=config['Nf'], Kx=config['Kx'], Kl=config['Kl'], n_max=config['n_max'],
-        h0_size=config['h0_size'], num_layers=config['transformer_layers'],
-        num_heads=config['num_heads'], key_size=config['key_size'],
-        model_size=config['model_size'], embed_size=config['embed_size'],
-        atom_types=config['atom_types'], wyck_types=config['wyck_types'],
-        dropout_rate=config['dropout_rate']
-    )
-    
-    # Load JAX
-    jax_path = os.path.join(CURRENT_DIR, "pretrained_model", "epoch_005500.pkl")
-    jax_params = load_jax_weights(jax_path)
-    
-    # Convert
-    model = convert_weights(jax_params, model)
-    
-    # Save
-    out_path = os.path.join(CURRENT_DIR, "pretrained_model", "epoch_005500.pt")
-    torch.save(model.state_dict(), out_path)
-    print(f"Saved PyTorch weights to {out_path}")
-
-if __name__ == "__main__":
-    main()
+        b_q = jax_to_torch(jax_attn['query']['b'].reshape
