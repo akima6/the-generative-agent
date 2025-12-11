@@ -10,61 +10,30 @@ import copy
 from crystalformer.src.lattice import norm_lattice
 
 def make_ppo_loss_fn(logp_fn, eps_clip, beta=0.1):
-    """
-    Returns a PPO loss function (Closure).
-    ...
-    """
-    # Define a MAX KL DIVERGENCE (Standard practice for stable PPO)
-    KL_TARGET = 0.015
+    # Set the safe clamp value
     KL_MAX = 0.05
     
     def ppo_loss_fn(model, x, old_logp, pretrain_logp, advantages):
-        # ... (Unpack inputs)
-        G, L, XYZ, A, W = x
+        # ... (lines)
         
-        # 1. Compute current log probs
-        logp_w, logp_xyz, logp_a, logp_l = logp_fn(model, G, L, XYZ, A, W, is_train=True)
-        new_logp = logp_w + logp_xyz + logp_a + logp_l
-
-        # 2. KL Divergence Penalty (P || P_pretrain)
-        # Note: The raw difference is -KL (since logp is negative, new_logp is lower)
-        # We need to compute the KL properly: KL = - (new_logp - pretrain_logp) for P_old || P_new.
-        # But here we are computing P_new || P_pretrain, which is PPO-DPO style.
-        # Let's stick to the JAX original: kl_loss = new_logp - pretrain_logp
+        # 2. KL Divergence Penalty
+        kl_raw = pretrain_logp - new_logp
         
-        kl_raw = pretrain_logp - new_logp # This is closer to KL(P_pretrain || P_new)
+        # We need the mean KL to be positive for the penalty term.
+        kl_clamped_mean = torch.mean(torch.clamp(kl_raw, min=-1.0, max=KL_MAX)) # Clamp on the mean
         
-        # CRITICAL FIX 1: Clamp the KL to prevent explosion and NaN
-        kl_clamped = torch.clamp(kl_raw, max=KL_MAX)
-        kl_clamped_mean = torch.mean(kl_clamped) # This is the mean KL for logging
+        # PPO Loss is calculated correctly using the clip term (surr1, surr2)
+        # We add the KL as a separate penalty term to the negative objective
         
-        # CRITICAL FIX 2: Apply a penalty only when the KL exceeds the target
-        # This is a DPO-style method to make the KL penalty more active
-        kl_penalty = torch.where(kl_clamped_mean > KL_TARGET, beta * (kl_clamped_mean - KL_TARGET), torch.tensor(0.0, device=G.device))
-        
-        # Original JAX PPO:
-        # advantages_adj = advantages - beta * kl_loss 
-        # But since the KL is so large, this is unstable.
-
-        # Let's use the simplest and most robust PPO implementation:
-        
-        # 2. KL-adjusted Advantages
-        # PPO is robust enough to not need the advantage adjustment unless the policy is bad.
-        # We will use the raw advantage for the clip term, and the KL term for the loss term.
-        
-        # 3. Ratio (pi_theta / pi_theta_old)
-        ratios = torch.exp(new_logp - old_logp)
-
-        # 4. Surrogate Objectives (using raw advantages)
-        surr1 = ratios * advantages
-        surr2 = torch.clamp(ratios, 1.0 - eps_clip, 1.0 + eps_clip) * advantages
-
-        # 5. Final PPO Loss (Minimize)
+        # Final PPO Loss (Minimize)
         # Loss = - Objective + KL_Penalty
-        ppo_objective = torch.min(surr1, surr2)
-        ppo_loss = -torch.mean(ppo_objective) + kl_penalty # Minimize Loss
+        # We use the clamped KL for stability in the loss term
+        kl_penalty = beta * kl_clamped_mean
         
-        # Return negative objective (loss) and the mean KL for logging
+        ppo_objective = torch.min(surr1, surr2)
+        ppo_loss = -torch.mean(ppo_objective) + kl_penalty 
+        
+        # Return loss and the *clamped* KL for logging
         return ppo_loss, kl_clamped_mean
     
     return ppo_loss_fn
