@@ -42,11 +42,7 @@ class TransformerBlock(nn.Module):
                     nn.init.zeros_(m.bias)
 
     def forward(self, x, mask=None, is_train=True):
-        # x: (Batch, SeqLen, ModelSize)
         h_norm = self.ln1(x)
-        
-        # attn_mask should be (SeqLen, SeqLen) or (Batch*NumHeads, SeqLen, SeqLen)
-        # We assume standard causal mask passed from main model
         attn_out, _ = self.attn(h_norm, h_norm, h_norm, attn_mask=mask, need_weights=False)
         
         if is_train:
@@ -85,7 +81,6 @@ class CrystalTransformer(nn.Module):
         self.lattice_types = Kl + 2 * 6 * Kl
         self.output_size = max(atom_types + self.lattice_types, self.coord_types, wyck_types)
 
-        # Embeddings
         self.g_embeddings = nn.Embedding(230, embed_size)
         self.w_embeddings = nn.Embedding(wyck_types, embed_size)
         self.a_embeddings = nn.Embedding(atom_types, embed_size)
@@ -99,12 +94,8 @@ class CrystalTransformer(nn.Module):
         else:
             self.w_params = nn.Parameter(torch.randn(230, wyck_types) * 0.01)
 
-        # Projections
-        # hW input: G(emb) + W(emb) + M(1)
         self.fc_hW = nn.Linear(2 * embed_size + 1, model_size)
-        # hA input: G(emb) + A(emb)
         self.fc_hA = nn.Linear(2 * embed_size, model_size)
-        # hXYZ input: G(emb) + Fourier(2*Nf)
         self.fc_hXYZ = nn.Linear(embed_size + 2 * Nf, model_size)
 
         self.layers = nn.ModuleList([
@@ -125,8 +116,6 @@ class CrystalTransformer(nn.Module):
                     nn.init.zeros_(m.bias)
 
     def renormalize_coord(self, h_x):
-        # h_x: (Batch, n, output_size)
-        # Only process first coord_types dims
         relevant = h_x[..., :self.coord_types]
         x_logit, x_loc, x_kappa = torch.split(relevant, [self.Kx, self.Kx, self.Kx], dim=-1)
         
@@ -137,27 +126,16 @@ class CrystalTransformer(nn.Module):
         return torch.cat([x_logit, x_loc, x_kappa, padding], dim=-1)
 
     def forward(self, G, XYZ, A, W, M, is_train=True):
-        """
-        Supports Batched Input.
-        G: (Batch,)
-        XYZ: (Batch, n, 3)
-        A: (Batch, n)
-        W: (Batch, n)
-        M: (Batch, n)
-        """
         device = self.g_embeddings.weight.device
         
-        # Ensure inputs are tensors
         if not isinstance(G, torch.Tensor): G = torch.tensor(G, device=device)
         XYZ = XYZ.to(device)
         A = A.to(device)
         W = W.to(device)
         M = M.to(device)
 
-        # Handle Batch Dimension logic
         is_batched = XYZ.ndim == 3
         if not is_batched:
-            # Add batch dim for internal processing
             G = G.reshape(1)
             XYZ = XYZ.unsqueeze(0)
             A = A.unsqueeze(0)
@@ -168,56 +146,44 @@ class CrystalTransformer(nn.Module):
         n_atoms = XYZ.shape[1]
         
         G_idx = G.long() - 1
-        g_emb = self.g_embeddings(G_idx) # (Batch, emb)
+        g_emb = self.g_embeddings(G_idx) 
         
-        # --- 1. Compute h0 (First prediction) ---
-        # wmax table lookup
-        wmax_tensor = torch.tensor(wmax_table, device=device) # (230,)
-        w_max_val = wmax_tensor[G_idx] # (Batch,)
+        wmax_tensor = torch.tensor(wmax_table, device=device) 
+        w_max_val = wmax_tensor[G_idx] 
 
         if self.h0_size > 0:
-            w_logit_0 = self.h0_mlp(g_emb) # (Batch, wyck_types)
+            w_logit_0 = self.h0_mlp(g_emb) 
         else:
             w_logit_0 = self.w_params[G_idx] 
 
-        # Masking h0
-        w_range = torch.arange(self.wyck_types, device=device).unsqueeze(0) # (1, wyck)
-        # Broadcast w_max_val to (Batch, 1)
+        w_range = torch.arange(self.wyck_types, device=device).unsqueeze(0) 
         w_mask_0 = (w_range > 0) & (w_range <= w_max_val.unsqueeze(1))
         
         w_logit_0 = torch.where(w_mask_0, w_logit_0, w_logit_0 - 1e10)
         w_logit_0 = torch.log_softmax(w_logit_0, dim=1)
         
-        # h0 vector
         h0 = torch.cat([
-            w_logit_0.unsqueeze(1), # (Batch, 1, wyck)
+            w_logit_0.unsqueeze(1), 
             torch.zeros((batch_size, 1, self.output_size - self.wyck_types), device=device)
-        ], dim=-1) # (Batch, 1, output)
+        ], dim=-1) 
         
         if n_atoms == 0:
             return h0 if is_batched else h0.squeeze(0)
 
-        # --- 2. Sequence Embedding ---
-        # Broadcast G_emb: (Batch, emb) -> (Batch, n, emb)
         g_emb_exp = g_emb.unsqueeze(1).expand(-1, n_atoms, -1)
         
-        # hW
-        w_emb = self.w_embeddings(W.long()) # (Batch, n, emb)
+        w_emb = self.w_embeddings(W.long()) 
         hW_in = torch.cat([g_emb_exp, w_emb, M.float().unsqueeze(-1)], dim=-1)
-        hW = self.fc_hW(hW_in) # (Batch, n, model)
+        hW = self.fc_hW(hW_in) 
 
-        # hA
         a_emb = self.a_embeddings(A.long())
         hA_in = torch.cat([g_emb_exp, a_emb], dim=-1)
         hA = self.fc_hA(hA_in)
 
-        # hXYZ (Fourier)
-        X, Y, Z = XYZ[:,:,0], XYZ[:,:,1], XYZ[:,:,2] # (Batch, n)
+        X, Y, Z = XYZ[:,:,0], XYZ[:,:,1], XYZ[:,:,2] 
         
         def fourier_encode(coords, Nf):
-            # coords: (Batch, n)
             freqs = torch.arange(1, Nf+1, device=device).float()
-            # args: (Batch, n, 1) * (1, 1, Nf) -> (Batch, n, Nf)
             args = 2 * math.pi * coords.unsqueeze(-1) * freqs.view(1, 1, -1)
             return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
         
@@ -229,23 +195,11 @@ class CrystalTransformer(nn.Module):
         hY = self.fc_hXYZ(torch.cat([g_emb_exp, hY_f], dim=-1))
         hZ = self.fc_hXYZ(torch.cat([g_emb_exp, hZ_f], dim=-1))
         
-        # --- 3. Interleave ---
-        # Stack: (Batch, n, 5, model)
         h = torch.stack([hW, hA, hX, hY, hZ], dim=2)
         h = h.reshape(batch_size, 5 * n_atoms, self.model_size)
         
-        # --- 4. Transformer Attention ---
         seq_len = 5 * n_atoms
-        # Causal Mask
-        # (Seq, Seq) - same for all batches
         mask = torch.triu(torch.ones(seq_len, seq_len, device=device), diagonal=1).bool()
-        # PyTorch `attn_mask`: True positions are ignored (masked out).
-        # We want to mask future positions (triu).
-        
-        # If is_train=False (generation), we can cache, but standard implementation handles it.
-        # Actually standard nn.MHA takes float/bool mask. 
-        # Float: -inf for mask, 0 for keep.
-        # Bool: True for mask, False for keep.
         
         float_mask = torch.zeros(seq_len, seq_len, device=device)
         float_mask = float_mask.masked_fill(mask, float('-inf'))
@@ -254,9 +208,8 @@ class CrystalTransformer(nn.Module):
             h = layer(h, mask=float_mask, is_train=is_train)
             
         h = self.final_norm(h)
-        h = self.output_proj(h) # (Batch, 5*n, output)
+        h = self.output_proj(h) 
         
-        # --- 5. Unpack and Process Outputs ---
         h = h.reshape(batch_size, n_atoms, 5, -1)
         
         h_al = h[:, :, 0, :]
@@ -265,137 +218,27 @@ class CrystalTransformer(nn.Module):
         h_z = h[:, :, 3, :]
         w_logit_seq = h[:, :, 4, :]
         
-        # Renormalize Coords
         h_x = self.renormalize_coord(h_x)
         h_y = self.renormalize_coord(h_y)
         h_z = self.renormalize_coord(h_z)
         
-        # Logits
         a_logit = h_al[..., :self.atom_types]
         w_logit = w_logit_seq[..., :self.wyck_types]
         
-        # --- Masking Logic (Batched) ---
-        
-        # (1) W constraints: W_0 <= W_1 ...
-        # W: (Batch, n)
-        # w_range: (1, 1, wyck-1)
+        # --- Masking Logic ---
         w_range = torch.arange(1, self.wyck_types, device=device).view(1, 1, -1)
-        W_uns = W.unsqueeze(-1) # (Batch, n, 1)
+        W_uns = W.unsqueeze(-1) 
         
         mask_less_equal = w_range < W_uns
         mask_less = w_range <= W_uns
         
-        # dof0 lookup
-        dof0_gpu = torch.tensor(dof0_table, device=device) # (230, wyck)
-        # Gather dof0 for current W
-        # W indices: (Batch, n)
-        # G indices: (Batch, 1) -> (Batch, n)
+        dof0_gpu = torch.tensor(dof0_table, device=device) 
         G_exp = G_idx.unsqueeze(1).expand(-1, n_atoms)
-        is_dof0 = dof0_gpu[G_exp, W.long()] # (Batch, n)
+        is_dof0 = dof0_gpu[G_exp, W.long()] 
         
-        # Select mask
-        # is_dof0: (Batch, n) -> (Batch, n, 1)
         w_mask_1 = torch.where(is_dof0.unsqueeze(-1), mask_less, mask_less_equal)
-        # Pad column 0
         pad_col = torch.zeros(batch_size, n_atoms, 1, device=device, dtype=torch.bool)
         w_mask_1 = torch.cat([pad_col, w_mask_1], dim=-1)
         
         w_logit = w_logit - torch.where(w_mask_1, torch.tensor(1e10, device=device), torch.tensor(0.0, device=device))
         w_logit = torch.log_softmax(w_logit, dim=-1)
-        
-        # (2) Pad Atom Logic
-        # W==0 means pad. If W==0, we force W_next=0 (pad) usually?
-        # Original: "enhance prob of pad atoms if there is already a type 0 atom"
-        # Logic: If W[i] == 0, then we heavily prefer pad for W[i] prediction?
-        # Actually original says: "mask = 1 for those locations to place pad atoms of type 0".
-        # If W==0, mask is 1 at index 0, 0 elsewhere.
-        # Then: w_logit = where(mask, 1e10, w_logit). -> Set index 0 to high prob.
-        pad_cond = (W == 0).unsqueeze(-1) # (Batch, n, 1)
-        w_mask_2 = torch.cat([
-            torch.ones(batch_size, n_atoms, 1, device=device),
-            torch.zeros(batch_size, n_atoms, self.wyck_types-1, device=device)
-        ], dim=-1).bool()
-        
-        # Apply only where pad_cond is true
-        # If pad_cond is True (W=0), we want w_logit[0] to be huge, others small.
-        # Original: where(w_mask, 1e10, w_logit).
-        # This makes index 0 -> 1e10. 
-        # But only if W=0.
-        
-        # Let's just add 1e10 to index 0 if W=0.
-        w_logit[..., 0] = torch.where(W==0, w_logit[..., 0] + 1e10, w_logit[..., 0])
-        w_logit = torch.log_softmax(w_logit, dim=-1)
-        
-        # (3) w_max constraint
-        # w_max_val: (Batch,) -> (Batch, 1, 1)
-        w_indices = torch.arange(self.wyck_types, device=device).view(1, 1, -1)
-        w_mask_3 = w_indices <= w_max_val.view(-1, 1, 1)
-        w_logit = torch.where(w_mask_3, w_logit, w_logit - 1e10)
-        w_logit = torch.log_softmax(w_logit, dim=-1)
-        
-        # (4) Atom Masking
-        # If W > 0, mask out pad (type 0).
-        # If W == 0, mask out true atoms (type > 0).
-        # mask[0] is (W>0). mask[1:] is (W==0).
-        w_gt_0 = (W > 0).unsqueeze(-1)
-        w_eq_0 = (W == 0).unsqueeze(-1)
-        
-        a_mask = torch.cat([
-            w_gt_0,
-            w_eq_0.repeat(1, 1, self.atom_types - 1)
-        ], dim=-1)
-        
-        a_logit = a_logit - torch.where(a_mask, torch.tensor(1e10, device=device), torch.tensor(0.0, device=device))
-        a_logit = torch.log_softmax(a_logit, dim=-1)
-        
-        # Re-assemble w_logit full
-        w_logit_final = torch.cat([
-            w_logit,
-            torch.zeros(batch_size, n_atoms, self.output_size - self.wyck_types, device=device)
-        ], dim=-1)
-        
-        # Lattice Parts (Batch, n, output)
-        l_part = h_al[..., self.atom_types : self.atom_types + self.lattice_types]
-        l_logit, mu, sigma = torch.split(l_part, [self.Kl, 6*self.Kl, 6*self.Kl], dim=-1)
-        
-        l_logit = torch.log_softmax(l_logit, dim=-1)
-        sigma = F.softplus(sigma) + self.sigmamin
-        
-        h_al_final = torch.cat([
-            a_logit,
-            l_logit,
-            mu,
-            sigma,
-            torch.zeros(batch_size, n_atoms, self.output_size - self.atom_types - self.lattice_types, device=device)
-        ], dim=-1)
-        
-        # Final Stack
-        h_final = torch.stack([
-            h_al_final,
-            h_x,
-            h_y,
-            h_z,
-            w_logit_final
-        ], dim=2) # (Batch, n, 5, output)
-        
-        h_final = h_final.reshape(batch_size, 5*n_atoms, self.output_size)
-        
-        # Concatenate h0 at seq dim
-        result = torch.cat([h0, h_final], dim=1) # (Batch, 5*n+1, output)
-        
-        if not is_batched:
-            return result.squeeze(0)
-            
-        return result
-
-def make_transformer(key, Nf, Kx, Kl, n_max, h0_size, num_layers, num_heads, key_size, 
-                     model_size, embed_size, atom_types, wyck_types, dropout_rate, 
-                     attn_dropout=0.1, widening_factor=4, sigmamin=1e-3):
-    return CrystalTransformer(
-        Nf=Nf, Kx=Kx, Kl=Kl, n_max=n_max, h0_size=h0_size, 
-        num_layers=num_layers, num_heads=num_heads, key_size=key_size, 
-        model_size=model_size, embed_size=embed_size, 
-        atom_types=atom_types, wyck_types=wyck_types, 
-        dropout_rate=dropout_rate, attn_dropout=attn_dropout, 
-        widening_factor=widening_factor, sigmamin=sigmamin
-    )
