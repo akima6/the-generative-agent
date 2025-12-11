@@ -28,28 +28,49 @@ def get_param(params, key, subkey):
     if key not in params:
         raise KeyError(f"Key '{key}' not found.")
     if subkey not in params[key]:
-        raise KeyError(f"Subkey '{subkey}' not found in '{key}'.")
+        # Fallback: Maybe the parameter IS the key value (no subkey)?
+        # This happens if someone did params['key'] = array
+        raise KeyError(f"Subkey '{subkey}' not found in '{key}'. Available: {list(params[key].keys())}")
     return jax_to_torch(params[key][subkey])
 
+def get_direct_param(params, scope, key):
+    """Gets a parameter that is directly stored (no w/b sub-dictionary)."""
+    if scope not in params:
+        raise KeyError(f"Scope '{scope}' not found.")
+    if key not in params[scope]:
+        raise KeyError(f"Key '{key}' not found in scope '{scope}'.")
+    return jax_to_torch(params[scope][key])
+
 def convert_weights(jax_params, torch_model):
-    print("Converting weights (Mapped Structure)...")
+    print("Converting weights (Mapped Structure - Fixed Embeddings)...")
     state_dict = torch_model.state_dict()
     
     # --- 1. EMBEDDINGS (Under '~') ---
+    # hk.get_parameter stores weights directly under the name in the scope
     print("  - Converting Embeddings...")
-    embeddings = jax_params['~']
-    state_dict['g_embeddings.weight'] = jax_to_torch(embeddings['g_embeddings']['embeddings'])
-    state_dict['w_embeddings.weight'] = jax_to_torch(embeddings['w_embeddings']['embeddings'])
-    state_dict['a_embeddings.weight'] = jax_to_torch(embeddings['a_embeddings']['embeddings'])
+    embeddings_scope = jax_params.get('~')
+    if embeddings_scope is None:
+        print("Error: Scope '~' not found. Cannot load embeddings.")
+        sys.exit(1)
+
+    state_dict['g_embeddings.weight'] = jax_to_torch(embeddings_scope['g_embeddings'])
+    state_dict['w_embeddings.weight'] = jax_to_torch(embeddings_scope['w_embeddings'])
+    state_dict['a_embeddings.weight'] = jax_to_torch(embeddings_scope['a_embeddings'])
 
     # --- 2. h0 MLP & PROJECTIONS ---
     print("  - Converting Projections...")
-    # Based on layer counts:
-    # linear, linear_1 -> h0_mlp
-    # linear_2 -> hW
-    # linear_3 -> hA
-    # linear_4,5,6 -> hXYZ
     
+    # Check for w_params (if h0_size=0)
+    # It would likely be in '~' if it exists
+    if 'w_params' in embeddings_scope:
+        print("    Found w_params (Table Lookup)")
+        state_dict['w_params'] = jax_to_torch(embeddings_scope['w_params'])
+        linear_offset = 0
+    else:
+        # h0 MLP exists, uses linear_0 and linear_1
+        print("    Found h0 MLP (Linear 0 & 1)")
+        linear_offset = 2
+
     def get_lin(idx, torch_name):
         suffix = f"_{idx}" if idx > 0 else ""
         key = f"linear{suffix}"
@@ -58,21 +79,25 @@ def convert_weights(jax_params, torch_model):
         state_dict[f'{torch_name}.weight'] = w.t()
         state_dict[f'{torch_name}.bias'] = b
 
-    # h0 MLP
-    get_lin(0, 'h0_mlp.0')
-    get_lin(1, 'h0_mlp.2')
+    # If h0 MLP exists, load it
+    if linear_offset == 2:
+        get_lin(0, 'h0_mlp.0')
+        get_lin(1, 'h0_mlp.2')
+
+    # Projections (indices shift based on linear_offset)
+    # fc_hW
+    get_lin(linear_offset + 0, 'fc_hW')
+    # fc_hA
+    get_lin(linear_offset + 1, 'fc_hA')
     
-    # hW, hA
-    get_lin(2, 'fc_hW')
-    get_lin(3, 'fc_hA')
-    
-    # hXYZ (Average 4, 5, 6)
-    w4 = get_param(jax_params, 'linear_4', 'w')
-    w5 = get_param(jax_params, 'linear_5', 'w')
-    w6 = get_param(jax_params, 'linear_6', 'w')
-    b4 = get_param(jax_params, 'linear_4', 'b')
-    b5 = get_param(jax_params, 'linear_5', 'b')
-    b6 = get_param(jax_params, 'linear_6', 'b')
+    # fc_hXYZ (Average next 3)
+    idx_base = linear_offset + 2
+    w4 = get_param(jax_params, f'linear_{idx_base}', 'w')
+    w5 = get_param(jax_params, f'linear_{idx_base+1}', 'w')
+    w6 = get_param(jax_params, f'linear_{idx_base+2}', 'w')
+    b4 = get_param(jax_params, f'linear_{idx_base}', 'b')
+    b5 = get_param(jax_params, f'linear_{idx_base+1}', 'b')
+    b6 = get_param(jax_params, f'linear_{idx_base+2}', 'b')
     
     state_dict['fc_hXYZ.weight'] = ((w4+w5+w6)/3.0).t()
     state_dict['fc_hXYZ.bias'] = (b4+b5+b6)/3.0
@@ -80,7 +105,14 @@ def convert_weights(jax_params, torch_model):
     # --- 3. TRANSFORMER BLOCKS ---
     print("  - Converting Transformer Blocks...")
     num_layers = len(torch_model.layers)
-    mlp_start_idx = 7 # linear_7
+    # Start after the 5 projection layers (2 for h0 + 1 hW + 1 hA + 3 hXYZ = 7 linears consumed so far?)
+    # Wait, indices:
+    # 0,1 (h0)
+    # 2 (hW)
+    # 3 (hA)
+    # 4,5,6 (hXYZ)
+    # Next is 7.
+    mlp_start_idx = linear_offset + 5 
     
     for i in range(num_layers):
         # Layer Norms
@@ -101,16 +133,6 @@ def convert_weights(jax_params, torch_model):
         
         # Attention
         attn_key = f"multi_head_attention_{i}" if i > 0 else "multi_head_attention"
-        
-        def get_attn_w(sub):
-            w = get_param(jax_params, attn_key, sub) # sub is 'query', 'key', etc.
-            # JAX structure inside is {'b': ..., 'w': ...}
-            # Wait, get_param expects subkey.
-            # Here jax_params[attn_key] is a dict {'query': {'b', 'w'}, ...}
-            # So we need to access manually.
-            pass
-
-        # Helper for Attention Sub-modules
         attn_dict = jax_params[attn_key]
         
         def to_pt(w): 
@@ -142,6 +164,7 @@ def convert_weights(jax_params, torch_model):
     final_lin_idx = mlp_start_idx + 2*num_layers
     get_lin(final_lin_idx, 'output_proj')
 
+    print("Load state dict into model...")
     torch_model.load_state_dict(state_dict)
     print("Success!")
     return torch_model
@@ -162,13 +185,18 @@ def main():
     )
     
     jax_path = os.path.join(CURRENT_DIR, "pretrained_model", "epoch_005500.pkl")
-    jax_params = load_jax_weights(jax_path)
-    
-    model = convert_weights(jax_params, model)
-    
-    out_path = os.path.join(CURRENT_DIR, "pretrained_model", "epoch_005500.pt")
-    torch.save(model.state_dict(), out_path)
-    print(f"Saved PyTorch weights to {out_path}")
+    try:
+        jax_params = load_jax_weights(jax_path)
+        model = convert_weights(jax_params, model)
+        
+        out_path = os.path.join(CURRENT_DIR, "pretrained_model", "epoch_005500.pt")
+        torch.save(model.state_dict(), out_path)
+        print(f"Saved PyTorch weights to {out_path}")
+        
+    except Exception as e:
+        print(f"\nCONVERSION FAILED: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     main()
