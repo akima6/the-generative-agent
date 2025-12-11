@@ -4,7 +4,20 @@ import numpy as np
 import re
 import torch
 import sys
-
+from .utils import letter_to_number
+def letter_to_number(letter):
+    """
+    'a' to 1 , 'b' to 2 , 'z' to 26, and 'A' to 27
+    (Note: 0 is reserved for the pad token)
+    """
+    letter = letter.lower()
+    if 'a' <= letter <= 'z':
+        return ord(letter) - ord('a') + 1
+    elif letter == 'a' and len(letter) == 1: # Catch for simple 'A' if used
+        return 27
+    else:
+        return 0 # Return 0 (pad) for invalid or unhandled chars
+        
 def from_xyz_str(xyz_str: str):
     """
     Args:
