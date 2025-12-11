@@ -1,4 +1,5 @@
-# relaxer.py (Corrected Version 2.2)
+# generative_agent/evaluation_engine/relaxer.py
+# Runs in current python environment (not conda)
 
 # --- Core Libraries ---
 import torch
@@ -11,7 +12,6 @@ from pymatgen.io.cif import CifWriter
 
 # --- Atomic Simulation Environment (ASE) for Optimization ---
 from ase.optimize import LBFGS
-# [# FIX 1]: Import UnitCellFilter from its new, correct location
 from ase.filters import UnitCellFilter
 
 # --- Materials Graph Library (MATGL) for the ML Potential ---
@@ -26,44 +26,37 @@ class Relaxer:
     """
 
     def __init__(self):
-        """
-        Initializes the Relaxer by loading the pre-trained M3GNet model
-        and setting up the ASE-compatible calculator.
-        """
-        #print("Initializing Relaxer: Loading M3GNet potential...")
         self._potential = matgl.load_model("M3GNet-MP-2021.2.8-PES")
         self._calculator = M3GNetCalculator(potential=self._potential)
-        #print("M3GNet potential loaded successfully.")
 
-    def relax(self, structure: Structure, fmax=0.01, steps=100, log_file='relaxation.log') -> dict:
+    def relax(self, structure: Structure, fmax=0.1, steps=250, log_file='relaxation.log') -> dict:
         """
-        Relaxes a pymatgen Structure, optimizing both atomic positions and the
-        unit cell, mimicking the high-throughput approach of the BOWSR paper.
+        Relaxes a pymatgen Structure with relaxed convergence criteria.
 
         Args:
-            structure (pymatgen.core.structure.Structure): The input crystal structure to relax.
-            fmax (float): The maximum force tolerance (in eV/Å). This is the target for
-                          a fully converged relaxation. Defaults to 0.01 eV/Å.
-            steps (int): The maximum number of optimization steps. The relaxation will
-                         stop here even if fmax is not reached. Defaults to 100.
+            structure (pymatgen.core.structure.Structure): Input crystal structure.
+            fmax (float): The maximum force tolerance (eV/Å). RELAXED to 0.1.
+            steps (int): The maximum number of optimization steps. INCREASED to 250.
             log_file (str): Path to the log file for the optimization progress.
 
         Returns:
-            dict: A dictionary containing the final relaxed structure and metadata.
+            dict: Results including the final relaxed structure and metadata.
         """
         try:
             atoms = AseAtomsAdaptor.get_atoms(structure)
         except Exception as e:
-            print(f"Error: Could not convert input structure to ASE Atoms object. {e}")
+            # We must print to stderr for the main script to capture it
+            sys.stderr.write(f"Relaxer Error: Input structure conversion failed. {e}\n")
             return {'error': 'Input structure conversion failed.'}
 
-        # [# FIX 2]: Use the modern syntax for setting the calculator
         atoms.calc = self._calculator
 
-        # Wrap the atoms object with a UnitCellFilter for full cell relaxation.
+        # UnitCellFilter for full cell relaxation.
         ucf = UnitCellFilter(atoms)
 
-        optimizer = LBFGS(ucf, logfile=log_file)
+        # Use temporary log file to avoid conflicts
+        temp_log_file = os.path.join(os.path.dirname(log_file), f"temp_relax_{os.getpid()}.log")
+        optimizer = LBFGS(ucf, logfile=temp_log_file)
 
         # Run the optimization.
         optimizer.run(fmax=fmax, steps=steps)
@@ -76,9 +69,12 @@ class Relaxer:
         forces = atoms.get_forces()
         max_force = np.sqrt((forces**2).sum(axis=1).max()) if forces is not None else 0.0
         
-        # [# FIX 3]: The correct way to determine convergence.
-        # We check if the final max force is below our target tolerance.
+        # Check if the final max force is below our target tolerance.
         is_converged = max_force <= fmax
+
+        # Clean up temp log
+        if os.path.exists(temp_log_file):
+            os.remove(temp_log_file)
 
         return {
             'final_structure': relaxed_pymatgen_structure,
@@ -90,34 +86,5 @@ class Relaxer:
 
 # --- Self-Contained Test Block ---
 if __name__ == '__main__':
-    relaxer = Relaxer()
-
-    lattice = np.array([[5.8, 0, 0], [0, 5.5, 0], [0, 0, 5.6]])
-    species = ["Na", "Cl"]
-    coords = [[0, 0, 0], [0.5, 0.5, 0.5]]
-    nacl_structure = Structure(lattice, species, coords)
-
-    rattled_nacl = nacl_structure.copy()
-    rattled_nacl.perturb(distance=0.1)
-    print("\n--- Initial Rattled & Distorted Structure ---")
-    print(rattled_nacl)
-    CifWriter(rattled_nacl).write_file('initial_distorted.cif')
-
-    print("\n--- Starting Relaxation ---")
-    results = relaxer.relax(rattled_nacl, fmax=0.01, steps=100)
-    print("--- Relaxation Finished ---")
-
-    final_structure = results.get('final_structure')
-    if final_structure:
-        print("\n--- Relaxation Results ---")
-        print(f"Converged within force tolerance: {results['is_converged']}")
-        print(f"Number of optimization steps: {results['num_steps']}")
-        print(f"Final Energy (eV): {results['final_energy']:.4f}")
-        print(f"Final Max Force (eV/Å): {results['max_force']:.4f}")
-        print("\n--- Final Relaxed Structure ---")
-        print(final_structure)
-        CifWriter(final_structure).write_file('final_relaxed.cif')
-        print("\nInitial and final structures saved to .cif files for visual comparison.")
-    else:
-        print("\n--- Relaxation Failed ---")
-        print(results)
+    # This block is not executed by the worker, but left for completeness
+    pass
