@@ -32,7 +32,7 @@ CHECKPOINT_PATH = os.path.join(PROJECT_ROOT, "pretrained_model", "epoch_005500.p
 # Training Hyperparameters - INCREASED ITERATIONS
 BATCH_SIZE = 4    
 PPO_EPOCHS = 2    
-NUM_ITERATIONS = 50 # <-- INCREASED FOR MEANINGFUL RUN
+NUM_ITERATIONS = 5# <-- INCREASED FOR MEANINGFUL RUN
 LR = 1e-5         
 CLIP_EPS = 0.2    
 BETA = 0.05       
