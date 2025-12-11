@@ -171,4 +171,25 @@ def main():
         Nf=config['Nf'], Kx=config['Kx'], Kl=config['Kl'], n_max=config['n_max'],
         h0_size=config['h0_size'], num_layers=config['transformer_layers'],
         num_heads=config['num_heads'], key_size=config['key_size'],
-        model_si
+        model_size=config['model_size'], embed_size=config['embed_size'],
+        atom_types=config['atom_types'], wyck_types=config['wyck_types'],
+        dropout_rate=config['dropout_rate']
+    )
+    
+    jax_path = os.path.join(CURRENT_DIR, "pretrained_model", "epoch_005500.pkl")
+    try:
+        jax_params = load_jax_weights(jax_path)
+        model = convert_weights(jax_params, model)
+        
+        out_path = os.path.join(CURRENT_DIR, "pretrained_model", "epoch_005500.pt")
+        torch.save(model.state_dict(), out_path)
+        print(f"Saved PyTorch weights to {out_path}")
+        
+    except Exception as e:
+        print(f"\nCONVERSION FAILED: {e}")
+        import traceback
+        traceback.print_exc()
+
+if __name__ == "__main__":
+    main()
+    
