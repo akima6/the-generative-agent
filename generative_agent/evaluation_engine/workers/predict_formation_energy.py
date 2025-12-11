@@ -5,7 +5,6 @@ def main():
     results = []
     args = sys.argv[1:]
     
-    # CRITICAL FIX: Add current directory to path for imports
     sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
     try:
@@ -15,7 +14,6 @@ def main():
         from pymatgen.core import Structure
         
         # Using a newer, highly stable MatGL model for formation energy
-        # The M3GNet-MP-2021.2.8 is more common now.
         model = matgl.load_model("M3GNet-MP-2021.2.8-Eform")
         
         for fp in args:
@@ -26,7 +24,7 @@ def main():
                 info["formation_energy"] = float(val)
                 results.append(info)
             except Exception as e:
-                info["error"] = f"Formation Energy failed: {str(e)}"
+                info["error"] = f"Prediction failed with error: {str(e)}"
                 results.append(info)
 
     except Exception as e:
@@ -35,3 +33,4 @@ def main():
     print(json.dumps(results if results else []))
 
 if __name__ == "__main__": main()
+    
