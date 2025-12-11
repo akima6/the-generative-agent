@@ -126,4 +126,56 @@ def convert_weights(jax_params, torch_model):
         w_k = to_pt_attn(jax_attn['key']['w'])
         w_v = to_pt_attn(jax_attn['value']['w'])
         
-        b_q = jax_to_torch(jax_attn['query']['b'].reshape
+        b_q = jax_to_torch(jax_attn['query']['b'].reshape(-1))
+        b_k = jax_to_torch(jax_attn['key']['b'].reshape(-1))
+        b_v = jax_to_torch(jax_attn['value']['b'].reshape(-1))
+        
+        state_dict[f'layers.{i}.attn.in_proj_weight'] = torch.cat([w_q, w_k, w_v], dim=0)
+        state_dict[f'layers.{i}.attn.in_proj_bias'] = torch.cat([b_q, b_k, b_v], dim=0)
+        
+        w_o = jax_to_torch(jax_attn['linear']['w']).t()
+        b_o = jax_to_torch(jax_attn['linear']['b'])
+        
+        state_dict[f'layers.{i}.attn.out_proj.weight'] = w_o
+        state_dict[f'layers.{i}.attn.out_proj.bias'] = b_o
+
+    # 4. Final Layers
+    final_ln_idx = 2 * num_layers
+    state_dict['final_norm.weight'] = jax_to_torch(jax_params[f'network/~/layer_norm_{final_ln_idx}']['scale'])
+    state_dict['final_norm.bias'] = jax_to_torch(jax_params[f'network/~/layer_norm_{final_ln_idx}']['offset'])
+    
+    final_lin_idx = 5 + 2 * num_layers
+    state_dict['output_proj.weight'] = jax_to_torch(jax_params[f'network/~/linear_{final_lin_idx}']['w']).t()
+    state_dict['output_proj.bias'] = jax_to_torch(jax_params[f'network/~/linear_{final_lin_idx}']['b'])
+
+    print("Load state dict into model...")
+    torch_model.load_state_dict(state_dict)
+    print("Success!")
+    return torch_model
+
+def main():
+    config_path = os.path.join(CURRENT_DIR, "pretrained_model", "config.yaml")
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+        
+    model = make_transformer(
+        key=None,
+        Nf=config['Nf'], Kx=config['Kx'], Kl=config['Kl'], n_max=config['n_max'],
+        h0_size=config['h0_size'], num_layers=config['transformer_layers'],
+        num_heads=config['num_heads'], key_size=config['key_size'],
+        model_size=config['model_size'], embed_size=config['embed_size'],
+        atom_types=config['atom_types'], wyck_types=config['wyck_types'],
+        dropout_rate=config['dropout_rate']
+    )
+    
+    jax_path = os.path.join(CURRENT_DIR, "pretrained_model", "epoch_005500.pkl")
+    jax_params = load_jax_weights(jax_path)
+    
+    model = convert_weights(jax_params, model)
+    
+    out_path = os.path.join(CURRENT_DIR, "pretrained_model", "epoch_005500.pt")
+    torch.save(model.state_dict(), out_path)
+    print(f"Saved PyTorch weights to {out_path}")
+
+if __name__ == "__main__":
+    main()
