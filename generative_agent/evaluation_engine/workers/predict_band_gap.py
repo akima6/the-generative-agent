@@ -5,12 +5,10 @@ def main():
     results = []
     args = sys.argv[1:]
     
-    # CRITICAL FIX: Add current directory to path for imports
     sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
     try:
-        # We rely on a robust MatGL model instead of legacy Megnet/TF if possible, 
-        # but the original used Megnet. Let's use the most stable modern Megnet.
+        # Megnet/TF setup
         import warnings, logging
         warnings.simplefilter("ignore")
         os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
