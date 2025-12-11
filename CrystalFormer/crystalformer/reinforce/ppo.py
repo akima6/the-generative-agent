@@ -12,21 +12,14 @@ from crystalformer.src.lattice import norm_lattice
 def make_ppo_loss_fn(logp_fn, eps_clip, beta=0.1):
     """
     Returns a PPO loss function (Closure).
-    This mimics the JAX factory pattern but simply returns the function below.
+    ...
     """
+    # Define a MAX KL DIVERGENCE (Standard practice for stable PPO)
+    KL_TARGET = 0.015
+    KL_MAX = 0.05
+    
     def ppo_loss_fn(model, x, old_logp, pretrain_logp, advantages):
-        """
-        PPO clipped objective function with KL divergence regularization
-        Loss = - (PPO-clip - beta * KL)  [We minimize negative objective]
-        
-        Args:
-            model: PyTorch model
-            x: tuple (G, L_norm, XYZ, A, W)
-            old_logp: Log probs from previous policy iteration
-            pretrain_logp: Log probs from frozen pre-trained model
-            advantages: Computed advantages
-        """
-        # Unpack inputs
+        # ... (Unpack inputs)
         G, L, XYZ, A, W = x
         
         # 1. Compute current log probs
@@ -34,30 +27,47 @@ def make_ppo_loss_fn(logp_fn, eps_clip, beta=0.1):
         new_logp = logp_w + logp_xyz + logp_a + logp_l
 
         # 2. KL Divergence Penalty (P || P_pretrain)
-        # We penalize deviation from the original pre-trained model to prevent mode collapse/forgetting
-        kl_loss = new_logp - pretrain_logp # (Batch,)
+        # Note: The raw difference is -KL (since logp is negative, new_logp is lower)
+        # We need to compute the KL properly: KL = - (new_logp - pretrain_logp) for P_old || P_new.
+        # But here we are computing P_new || P_pretrain, which is PPO-DPO style.
+        # Let's stick to the JAX original: kl_loss = new_logp - pretrain_logp
         
-        # Adjust advantages with KL penalty
-        # JAX original: advantages = advantages - beta * kl_loss
-        advantages_adj = advantages - beta * kl_loss
+        kl_raw = pretrain_logp - new_logp # This is closer to KL(P_pretrain || P_new)
+        
+        # CRITICAL FIX 1: Clamp the KL to prevent explosion and NaN
+        kl_clamped = torch.clamp(kl_raw, max=KL_MAX)
+        kl_clamped_mean = torch.mean(kl_clamped) # This is the mean KL for logging
+        
+        # CRITICAL FIX 2: Apply a penalty only when the KL exceeds the target
+        # This is a DPO-style method to make the KL penalty more active
+        kl_penalty = torch.where(kl_clamped_mean > KL_TARGET, beta * (kl_clamped_mean - KL_TARGET), torch.tensor(0.0, device=G.device))
+        
+        # Original JAX PPO:
+        # advantages_adj = advantages - beta * kl_loss 
+        # But since the KL is so large, this is unstable.
 
+        # Let's use the simplest and most robust PPO implementation:
+        
+        # 2. KL-adjusted Advantages
+        # PPO is robust enough to not need the advantage adjustment unless the policy is bad.
+        # We will use the raw advantage for the clip term, and the KL term for the loss term.
+        
         # 3. Ratio (pi_theta / pi_theta_old)
-        # exp(new - old)
         ratios = torch.exp(new_logp - old_logp)
 
-        # 4. Surrogate Objectives
-        surr1 = ratios * advantages_adj
-        surr2 = torch.clamp(ratios, 1.0 - eps_clip, 1.0 + eps_clip) * advantages_adj
+        # 4. Surrogate Objectives (using raw advantages)
+        surr1 = ratios * advantages
+        surr2 = torch.clamp(ratios, 1.0 - eps_clip, 1.0 + eps_clip) * advantages
 
-        # 5. Final PPO Objective (Maximize) -> Loss (Minimize)
-        # Mean over batch
-        ppo_objective = torch.mean(torch.min(surr1, surr2))
+        # 5. Final PPO Loss (Minimize)
+        # Loss = - Objective + KL_Penalty
+        ppo_objective = torch.min(surr1, surr2)
+        ppo_loss = -torch.mean(ppo_objective) + kl_penalty # Minimize Loss
         
-        # We return negative objective to minimize, and the mean KL for logging
-        return -ppo_objective, torch.mean(kl_loss)
+        # Return negative objective (loss) and the mean KL for logging
+        return ppo_loss, kl_clamped_mean
     
     return ppo_loss_fn
-
 
 def train(model, optimizer, spg_mask, loss_fn, logp_fn, batch_reward_fn, sample_crystal_fn, 
           epochs, ppo_epochs, batchsize, valid_data, path, checkpoint_interval=5):
