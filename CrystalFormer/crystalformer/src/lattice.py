@@ -48,9 +48,9 @@ def symmetrize_lattice(spacegroup, lattice):
 
     a, b, c, alpha, beta, gamma = lattice.unbind(-1)
     
-    # Constants
-    ninety = torch.tensor(90.0, device=device, dtype=lattice.dtype)
-    onetwenty = torch.tensor(120.0, device=device, dtype=lattice.dtype)
+    # Constants: Must be same shape as 'a' (Batch size)
+    ninety = torch.full_like(a, 90.0)
+    onetwenty = torch.full_like(a, 120.0)
 
     # Construct candidate lattices
     # Triclinic (1-2): [a, b, c, alpha, beta, gamma] (Input)
@@ -129,7 +129,7 @@ def norm_lattice(G, W, L):
     
     # Normalize length
     # num_atoms^(1/3) needs to be broadcast to (Batch, 3)
-    # Handle num_atoms = 0 safely? (Shouldn't happen for valid crystals)
+    # Handle num_atoms = 0 safely
     num_atoms = torch.clamp(num_atoms, min=1.0)
     
     scale = torch.pow(num_atoms, 1.0/3.0).unsqueeze(1)
