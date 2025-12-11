@@ -10,9 +10,10 @@ import copy
 
 # --- SETUP PATHS ---
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.dirname(os.path.dirname(CURRENT_DIR))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 CRYSTALFORMER_DIR = os.path.join(PROJECT_ROOT, "CrystalFormer")
-sys.path.append(CRYSTALFORMER_DIR)
+sys.path.insert(0, PROJECT_ROOT)
 
 # --- CRYSTALFORMER IMPORTS (Now using Rewritten Modules) ---
 from crystalformer.src.transformer import make_transformer
@@ -22,8 +23,8 @@ from crystalformer.src.lattice import norm_lattice
 from crystalformer.reinforce.ppo import make_ppo_loss_fn
 
 # --- LOCAL IMPORTS ---
-from .reward import RewardCalculator # <-- Use this simple form
-from .bridge import TensorBridge   # <-- Use this simple form
+from generative_agent.ppo_trainer.reward import RewardCalculator
+from generative_agent.ppo_trainer.bridge import TensorBridge 
 # --- CONFIGURATION ---
 CONFIG_PATH = os.path.join(PROJECT_ROOT, "pretrained_model", "config.yaml")
 CHECKPOINT_PATH = os.path.join(PROJECT_ROOT, "pretrained_model", "epoch_005500.pt")
