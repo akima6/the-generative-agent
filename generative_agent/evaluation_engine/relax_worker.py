@@ -1,5 +1,5 @@
 # generative_agent/evaluation_engine/relax_worker.py
-# Runs in 'matgl_env'
+# Runs in current python environment (not conda)
 
 import sys
 import os
@@ -7,11 +7,7 @@ import json
 from pathlib import Path
 
 def main():
-    # FIX: Add parent directory to sys.path to find relaxer.py
-    # relax_worker.py is in 'evaluation_engine'. We need 'evaluation_engine' to be in path.
-    # Actually, we need the CURRENT_DIR (evaluation_engine) to be in path.
-    # The script is run as python path/to/relax_worker.py
-    # So we need to add the directory it is in.
+    # FIX: Ensure all local imports work in the subprocess environment
     worker_dir = str(Path(os.path.abspath(__file__)).parent)
     if worker_dir not in sys.path:
         sys.path.append(worker_dir)
@@ -19,15 +15,14 @@ def main():
     results = []
     args = sys.argv[1:]
     
+    # Catch all errors and print them in the JSON output
     try:
         from pymatgen.core import Structure
         from pymatgen.io.cif import CifWriter
         import warnings
-        # Suppress DGL and Matgl warnings
         warnings.filterwarnings("ignore")
         
-        # FIX: Import Relaxer
-        # The script name is 'relaxer.py', so import as module 'relaxer'
+        # Import Relaxer (this will fail if matgl/ase are not installed)
         from relaxer import Relaxer 
         
         if len(args) < 2:
@@ -38,9 +33,6 @@ def main():
         input_paths = args[1:]
         os.makedirs(output_dir, exist_ok=True)
 
-        # FIX: Also check if parent directory is needed for other imports (e.g. matgl)
-        # Assuming required dependencies (matgl, ase) are installed in the main environment.
-        
         relaxer = Relaxer()
 
         for fp in input_paths:
@@ -48,16 +40,11 @@ def main():
             try:
                 struct = Structure.from_file(fp)
                 
-                # --- SAFETY CHECK ---
-                if struct.density < 0.1: 
-                    info["error"] = "Structure too sparse (density < 0.1)"
+                # --- SAFETY CHECK (Keep as is) ---
+                if struct.density < 0.1 or len(struct) < 2: 
+                    info["error"] = "Structure too sparse or too few atoms"
                     results.append(info)
                     continue
-                if len(struct) < 2: 
-                    info["error"] = "Structure has too few atoms (< 2)"
-                    results.append(info)
-                    continue
-                # --------------------
 
                 res = relaxer.relax(struct)
                 
@@ -71,12 +58,13 @@ def main():
                 
                 results.append(info)
             except Exception as e:
-                # FIX: Print full error for debugging in the log
+                # Catch per-structure errors
                 info["error"] = f"Relaxation failed with error: {str(e)}"
                 results.append(info)
 
     except Exception as e:
-        # Catastrophic failure catch for the whole script
+        # Catastrophic failure catch for the whole script (ImportError)
+        # This will be printed to STDOUT, which the main script will try to parse
         results = [{"error": f"Worker crashed (Import/Setup): {str(e)}", "input_file": "N/A"}]
 
     # The ONLY print to stdout. 
