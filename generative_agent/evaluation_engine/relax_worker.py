@@ -4,8 +4,18 @@
 import sys
 import os
 import json
+from pathlib import Path
 
 def main():
+    # FIX: Add parent directory to sys.path to find relaxer.py
+    # relax_worker.py is in 'evaluation_engine'. We need 'evaluation_engine' to be in path.
+    # Actually, we need the CURRENT_DIR (evaluation_engine) to be in path.
+    # The script is run as python path/to/relax_worker.py
+    # So we need to add the directory it is in.
+    worker_dir = str(Path(os.path.abspath(__file__)).parent)
+    if worker_dir not in sys.path:
+        sys.path.append(worker_dir)
+        
     results = []
     args = sys.argv[1:]
     
@@ -16,8 +26,9 @@ def main():
         # Suppress DGL and Matgl warnings
         warnings.filterwarnings("ignore")
         
-        # Import Relaxer only after setup
-        from relaxer import Relaxer
+        # FIX: Import Relaxer
+        # The script name is 'relaxer.py', so import as module 'relaxer'
+        from relaxer import Relaxer 
         
         if len(args) < 2:
             print(json.dumps([]))
@@ -27,6 +38,9 @@ def main():
         input_paths = args[1:]
         os.makedirs(output_dir, exist_ok=True)
 
+        # FIX: Also check if parent directory is needed for other imports (e.g. matgl)
+        # Assuming required dependencies (matgl, ase) are installed in the main environment.
+        
         relaxer = Relaxer()
 
         for fp in input_paths:
@@ -35,12 +49,11 @@ def main():
                 struct = Structure.from_file(fp)
                 
                 # --- SAFETY CHECK ---
-                # Check density to prevent "no valid edges" crash in DGL
-                if struct.density < 0.1: # Extremely low density
+                if struct.density < 0.1: 
                     info["error"] = "Structure too sparse (density < 0.1)"
                     results.append(info)
                     continue
-                if len(struct) < 2: # Single atom (cannot calculate bonds)
+                if len(struct) < 2: 
                     info["error"] = "Structure has too few atoms (< 2)"
                     results.append(info)
                     continue
@@ -58,16 +71,15 @@ def main():
                 
                 results.append(info)
             except Exception as e:
-                # Catch standard Python errors
-                info["error"] = str(e)
+                # FIX: Print full error for debugging in the log
+                info["error"] = f"Relaxation failed with error: {str(e)}"
                 results.append(info)
 
     except Exception as e:
         # Catastrophic failure catch for the whole script
-        results = [{"error": f"Worker crashed: {str(e)}"}]
+        results = [{"error": f"Worker crashed (Import/Setup): {str(e)}", "input_file": "N/A"}]
 
     # The ONLY print to stdout. 
-    # If results is empty, print empty list to avoid JSON error.
     print(json.dumps(results if results else []))
 
 if __name__ == "__main__":
