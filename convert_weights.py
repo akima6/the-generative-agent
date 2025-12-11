@@ -25,47 +25,32 @@ def jax_to_torch(param):
     return torch.tensor(np.array(param))
 
 def get_param(params, key, subkey):
-    """Safely get param from flat dictionary."""
     if key not in params:
-        # Try finding key with/without suffix logic if needed, but flat structure usually precise
-        raise KeyError(f"Key '{key}' not found in params.")
-    
-    val = params[key]
-    if subkey not in val:
-        raise KeyError(f"Subkey '{subkey}' not found in params['{key}']. Available: {list(val.keys())}")
-    
-    return jax_to_torch(val[subkey])
+        raise KeyError(f"Key '{key}' not found.")
+    if subkey not in params[key]:
+        raise KeyError(f"Subkey '{subkey}' not found in '{key}'.")
+    return jax_to_torch(params[key][subkey])
 
 def convert_weights(jax_params, torch_model):
-    print("Converting weights (Flat Structure)...")
+    print("Converting weights (Mapped Structure)...")
     state_dict = torch_model.state_dict()
     
-    # --- 1. Embeddings ---
-    # Keys: 'g_embeddings', 'w_embeddings', 'a_embeddings'
-    state_dict['g_embeddings.weight'] = get_param(jax_params, 'g_embeddings', 'embeddings')
-    state_dict['w_embeddings.weight'] = get_param(jax_params, 'w_embeddings', 'embeddings')
-    state_dict['a_embeddings.weight'] = get_param(jax_params, 'a_embeddings', 'embeddings')
-    
-    # h0 / w_params
-    if 'w_params' in jax_params:
-        print("Found w_params (Table Lookup h0)")
-        state_dict['w_params'] = get_param(jax_params, 'w_params', 'w_params')
-        linear_offset = 0
-    elif 'sequential/linear' in jax_params:
-        print("Found h0 MLP")
-        # Handle MLP conversion if needed
-        # Assuming table lookup for this checkpoint based on logs
-        linear_offset = 2 # If MLP uses 2 linears
-        pass 
-    else:
-        # Default assume table lookup if keys missing
-        linear_offset = 0
+    # --- 1. EMBEDDINGS (Under '~') ---
+    print("  - Converting Embeddings...")
+    embeddings = jax_params['~']
+    state_dict['g_embeddings.weight'] = jax_to_torch(embeddings['g_embeddings']['embeddings'])
+    state_dict['w_embeddings.weight'] = jax_to_torch(embeddings['w_embeddings']['embeddings'])
+    state_dict['a_embeddings.weight'] = jax_to_torch(embeddings['a_embeddings']['embeddings'])
 
-    # --- 2. Projections (Linear Layers) ---
-    # Standard: linear (hW), linear_1 (hA), linear_2,3,4 (hXYZ)
-    # Note: If h0 MLP exists, these indices shift.
+    # --- 2. h0 MLP & PROJECTIONS ---
+    print("  - Converting Projections...")
+    # Based on layer counts:
+    # linear, linear_1 -> h0_mlp
+    # linear_2 -> hW
+    # linear_3 -> hA
+    # linear_4,5,6 -> hXYZ
     
-    def get_linear(idx, torch_name):
+    def get_lin(idx, torch_name):
         suffix = f"_{idx}" if idx > 0 else ""
         key = f"linear{suffix}"
         w = get_param(jax_params, key, 'w')
@@ -73,118 +58,90 @@ def convert_weights(jax_params, torch_model):
         state_dict[f'{torch_name}.weight'] = w.t()
         state_dict[f'{torch_name}.bias'] = b
 
-    # fc_hW (linear_0)
-    get_linear(linear_offset + 0, 'fc_hW')
+    # h0 MLP
+    get_lin(0, 'h0_mlp.0')
+    get_lin(1, 'h0_mlp.2')
     
-    # fc_hA (linear_1)
-    get_linear(linear_offset + 1, 'fc_hA')
+    # hW, hA
+    get_lin(2, 'fc_hW')
+    get_lin(3, 'fc_hA')
     
-    # fc_hXYZ (Average 2, 3, 4)
-    def get_raw_linear(idx):
-        suffix = f"_{idx}" if idx > 0 else ""
-        key = f"linear{suffix}"
-        w = get_param(jax_params, key, 'w')
-        b = get_param(jax_params, key, 'b')
-        return w, b
+    # hXYZ (Average 4, 5, 6)
+    w4 = get_param(jax_params, 'linear_4', 'w')
+    w5 = get_param(jax_params, 'linear_5', 'w')
+    w6 = get_param(jax_params, 'linear_6', 'w')
+    b4 = get_param(jax_params, 'linear_4', 'b')
+    b5 = get_param(jax_params, 'linear_5', 'b')
+    b6 = get_param(jax_params, 'linear_6', 'b')
+    
+    state_dict['fc_hXYZ.weight'] = ((w4+w5+w6)/3.0).t()
+    state_dict['fc_hXYZ.bias'] = (b4+b5+b6)/3.0
 
-    w2, b2 = get_raw_linear(linear_offset + 2)
-    w3, b3 = get_raw_linear(linear_offset + 3)
-    w4, b4 = get_raw_linear(linear_offset + 4)
-    
-    state_dict['fc_hXYZ.weight'] = ((w2+w3+w4)/3.0).t()
-    state_dict['fc_hXYZ.bias'] = (b2+b3+b4)/3.0
-    
-    # Current Linear Index Counter
-    # We used 0, 1, 2, 3, 4. Next is 5.
-    curr_linear_idx = linear_offset + 5
-
-    # --- 3. Transformer Layers ---
+    # --- 3. TRANSFORMER BLOCKS ---
+    print("  - Converting Transformer Blocks...")
     num_layers = len(torch_model.layers)
+    mlp_start_idx = 7 # linear_7
     
     for i in range(num_layers):
         # Layer Norms
-        # 2 per layer. Indices: 0,1 for layer 0. 2,3 for layer 1...
-        ln1_idx = 2 * i
-        ln2_idx = 2 * i + 1
+        ln1_key = f"layer_norm_{2*i}" if 2*i > 0 else "layer_norm"
+        ln2_key = f"layer_norm_{2*i+1}"
         
-        ln1_suffix = f"_{ln1_idx}" if ln1_idx > 0 else ""
-        ln2_suffix = f"_{ln2_idx}" 
+        state_dict[f'layers.{i}.ln1.weight'] = get_param(jax_params, ln1_key, 'scale')
+        state_dict[f'layers.{i}.ln1.bias'] = get_param(jax_params, ln1_key, 'offset')
         
-        # LN1
-        key = f"layer_norm{ln1_suffix}"
-        state_dict[f'layers.{i}.ln1.weight'] = get_param(jax_params, key, 'scale')
-        state_dict[f'layers.{i}.ln1.bias'] = get_param(jax_params, key, 'offset')
-        
-        # LN2
-        key = f"layer_norm{ln2_suffix}"
-        state_dict[f'layers.{i}.ln2.weight'] = get_param(jax_params, key, 'scale')
-        state_dict[f'layers.{i}.ln2.bias'] = get_param(jax_params, key, 'offset')
+        state_dict[f'layers.{i}.ln2.weight'] = get_param(jax_params, ln2_key, 'scale')
+        state_dict[f'layers.{i}.ln2.bias'] = get_param(jax_params, ln2_key, 'offset')
         
         # MLP
-        # 2 Linears per layer.
-        l1_idx = curr_linear_idx
-        l2_idx = curr_linear_idx + 1
-        curr_linear_idx += 2
+        l1_idx = mlp_start_idx + 2*i
+        l2_idx = mlp_start_idx + 2*i + 1
+        get_lin(l1_idx, f'layers.{i}.mlp.0')
+        get_lin(l2_idx, f'layers.{i}.mlp.2')
         
-        get_linear(l1_idx, f'layers.{i}.mlp.0')
-        get_linear(l2_idx, f'layers.{i}.mlp.2')
+        # Attention
+        attn_key = f"multi_head_attention_{i}" if i > 0 else "multi_head_attention"
         
-        # ATTENTION
-        # Keys: multi_head_attention_{i}/query, /key, /value, /linear
-        attn_suffix = f"_{i}" if i > 0 else ""
-        base_attn_key = f"multi_head_attention{attn_suffix}"
+        def get_attn_w(sub):
+            w = get_param(jax_params, attn_key, sub) # sub is 'query', 'key', etc.
+            # JAX structure inside is {'b': ..., 'w': ...}
+            # Wait, get_param expects subkey.
+            # Here jax_params[attn_key] is a dict {'query': {'b', 'w'}, ...}
+            # So we need to access manually.
+            pass
+
+        # Helper for Attention Sub-modules
+        attn_dict = jax_params[attn_key]
         
-        # Query
-        w_q = get_param(jax_params, f"{base_attn_key}/query", 'w')
-        b_q = get_param(jax_params, f"{base_attn_key}/query", 'b')
-        
-        # Key
-        w_k = get_param(jax_params, f"{base_attn_key}/key", 'w')
-        b_k = get_param(jax_params, f"{base_attn_key}/key", 'b')
-        
-        # Value
-        w_v = get_param(jax_params, f"{base_attn_key}/value", 'w')
-        b_v = get_param(jax_params, f"{base_attn_key}/value", 'b')
-        
-        # PyTorch MHA packs Q,K,V
-        # JAX shape: (Embed, Heads, Dim) -> Flatten -> (Embed, Embed)
-        # PyTorch shape: (Embed, Embed) (Transposed)
-        
-        def process_attn_w(w):
-            return w.reshape(w.shape[0], -1).t()
+        def to_pt(w): 
+            return jax_to_torch(w.reshape(w.shape[0], -1)).t()
             
-        pt_w_q = process_attn_w(w_q.numpy()) # Convert to numpy for reshape if needed or check torch reshape
-        pt_w_k = process_attn_w(w_k.numpy())
-        pt_w_v = process_attn_w(w_v.numpy())
+        w_q = to_pt(attn_dict['query']['w'])
+        w_k = to_pt(attn_dict['key']['w'])
+        w_v = to_pt(attn_dict['value']['w'])
         
-        # Reshape bias: (Heads, Dim) -> (Embed,)
-        pt_b_q = b_q.reshape(-1)
-        pt_b_k = b_k.reshape(-1)
-        pt_b_v = b_v.reshape(-1)
+        b_q = jax_to_torch(attn_dict['query']['b'].reshape(-1))
+        b_k = jax_to_torch(attn_dict['key']['b'].reshape(-1))
+        b_v = jax_to_torch(attn_dict['value']['b'].reshape(-1))
         
-        state_dict[f'layers.{i}.attn.in_proj_weight'] = torch.cat([jax_to_torch(pt_w_q), jax_to_torch(pt_w_k), jax_to_torch(pt_w_v)], dim=0)
-        state_dict[f'layers.{i}.attn.in_proj_bias'] = torch.cat([pt_b_q, pt_b_k, pt_b_v], dim=0)
+        state_dict[f'layers.{i}.attn.in_proj_weight'] = torch.cat([w_q, w_k, w_v], dim=0)
+        state_dict[f'layers.{i}.attn.in_proj_bias'] = torch.cat([b_q, b_k, b_v], dim=0)
         
-        # Output Linear
-        # Key: .../linear
-        w_o = get_param(jax_params, f"{base_attn_key}/linear", 'w')
-        b_o = get_param(jax_params, f"{base_attn_key}/linear", 'b')
+        w_o = jax_to_torch(attn_dict['linear']['w']).t()
+        b_o = jax_to_torch(attn_dict['linear']['b'])
         
-        state_dict[f'layers.{i}.attn.out_proj.weight'] = w_o.t()
+        state_dict[f'layers.{i}.attn.out_proj.weight'] = w_o
         state_dict[f'layers.{i}.attn.out_proj.bias'] = b_o
 
-    # --- 4. Final Layers ---
-    # Final LN
-    final_ln_idx = 2 * num_layers
-    key = f"layer_norm_{final_ln_idx}"
-    state_dict['final_norm.weight'] = get_param(jax_params, key, 'scale')
-    state_dict['final_norm.bias'] = get_param(jax_params, key, 'offset')
+    # --- 4. FINAL LAYERS ---
+    print("  - Converting Final Layers...")
+    final_ln_key = f"layer_norm_{2*num_layers}"
+    state_dict['final_norm.weight'] = get_param(jax_params, final_ln_key, 'scale')
+    state_dict['final_norm.bias'] = get_param(jax_params, final_ln_key, 'offset')
     
-    # Final Linear
-    final_lin_idx = curr_linear_idx
-    get_linear(final_lin_idx, 'output_proj')
+    final_lin_idx = mlp_start_idx + 2*num_layers
+    get_lin(final_lin_idx, 'output_proj')
 
-    print("Load state dict into model...")
     torch_model.load_state_dict(state_dict)
     print("Success!")
     return torch_model
@@ -205,18 +162,13 @@ def main():
     )
     
     jax_path = os.path.join(CURRENT_DIR, "pretrained_model", "epoch_005500.pkl")
-    try:
-        jax_params = load_jax_weights(jax_path)
-        model = convert_weights(jax_params, model)
-        
-        out_path = os.path.join(CURRENT_DIR, "pretrained_model", "epoch_005500.pt")
-        torch.save(model.state_dict(), out_path)
-        print(f"Saved PyTorch weights to {out_path}")
-        
-    except Exception as e:
-        print(f"\nCONVERSION FAILED: {e}")
-        # Debug print keys if failed
-        # print(list(jax_params.keys())[:20])
+    jax_params = load_jax_weights(jax_path)
+    
+    model = convert_weights(jax_params, model)
+    
+    out_path = os.path.join(CURRENT_DIR, "pretrained_model", "epoch_005500.pt")
+    torch.save(model.state_dict(), out_path)
+    print(f"Saved PyTorch weights to {out_path}")
 
 if __name__ == "__main__":
     main()
