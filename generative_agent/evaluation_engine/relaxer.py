@@ -1,9 +1,11 @@
 # generative_agent/evaluation_engine/relaxer.py
+# Runs in current python environment (not conda)
 
 # --- Core Libraries ---
 import torch
 import numpy as np
 import sys
+import os
 
 # --- Materials Science Libraries ---
 from pymatgen.core.structure import Structure
@@ -16,47 +18,39 @@ from ase.filters import UnitCellFilter
 
 # --- Materials Graph Library (MATGL) for the ML Potential ---
 import matgl
-# CRITICAL FIX: Use the universal "MatglCalculator" which replaced M3GNetCalculator
-# and explicitly import the potential.
-try:
-    from matgl.ext.ase import MatglCalculator as M3GNetCalculator
-except ImportError:
-    # Fallback if an older matgl is somehow used
-    sys.stderr.write("MatglCalculator not found. This will likely crash.\n")
-    from matgl.ext.ase import M3GNetCalculator
-# ---------------------------------------------
+from matgl.ext.ase import MatglCalculator
 
 class Relaxer:
-    """
-    Final, robust relaxer using the universal MatglCalculator class.
-    """
-
     def __init__(self):
-        # We assume the model name is correct, as this is MatGL's standard.
         self._potential = matgl.load_model("M3GNet-MP-2021.2.8-PES")
-        # Use the general MatglCalculator class
-        self._calculator = M3GNetCalculator(potential=self._potential)
+        self._calculator = MatglCalculator(potential=self._potential)
 
-    def relax(self, structure: Structure, fmax=0.1, steps=250, log_file='relaxation.log') -> dict:
+    def relax(self, structure: Structure, fmax=0.1, steps=500, log_file='relaxation.log') -> dict:
         """
-        Relaxes a pymatgen Structure with relaxed convergence criteria.
+        Relaxes a pymatgen Structure with relaxed convergence criteria (fmax=0.1, steps=500).
         """
         try:
             atoms = AseAtomsAdaptor.get_atoms(structure)
         except Exception as e:
+            # We must print to stderr for the main script to capture it
             sys.stderr.write(f"Relaxer Error: Input structure conversion failed. {e}\n")
             return {'error': 'Input structure conversion failed.'}
 
         atoms.calc = self._calculator
-
         ucf = UnitCellFilter(atoms)
+
+        # Using a temporary log file to avoid conflicts
+        temp_log_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"temp_relax_{os.getpid()}.log")
         
-        # Use a temporary log file to avoid conflicts
-        temp_log_file = os.path.join(os.path.dirname(log_file), f"temp_relax_{os.getpid()}.log")
+        # Ensure log file exists for LBFGS (if used)
+        open(temp_log_file, 'a').close()
+        
         optimizer = LBFGS(ucf, logfile=temp_log_file)
 
+        # Run the optimization.
         optimizer.run(fmax=fmax, steps=steps)
 
+        # Convert back to a pymatgen Structure
         relaxed_pymatgen_structure = AseAtomsAdaptor.get_structure(atoms)
 
         final_energy = atoms.get_potential_energy()
@@ -75,8 +69,3 @@ class Relaxer:
             'max_force': max_force,
             'num_steps': optimizer.get_number_of_steps(),
         }
-
-# --- Self-Contained Test Block ---
-if __name__ == '__main__':
-    # This block is not executed by the worker, but left for completeness
-    pass
