@@ -1,28 +1,41 @@
 # generative_agent/evaluation_engine/workers/predict_formation_energy.py
-# Runs in 'matgl_env'
-import sys, json
+# Runs in current python environment (not conda)
+
+import sys, json, os
 
 def main():
     results = []
-    cif_paths = sys.argv[1:]
+    args = sys.argv[1:]
+    
+    # FIX: Add parent directory to sys.path to find matgl/other libs
+    sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+    # Catch all errors and print them in the JSON output
     try:
         import warnings
         warnings.filterwarnings("ignore")
         import matgl
         from pymatgen.core import Structure
         
-        # Load model silently
+        # FIX: Ensure MatGL model loads correctly
         model = matgl.load_model("M3GNet-MP-2018.6.1-Eform")
         
-        for fp in cif_paths:
+        for fp in args:
+            info = {"file_path": fp, "formation_energy": None, "error": None}
             try:
                 s = Structure.from_file(fp)
                 val = model.predict_structure(s).item()
-                results.append({"file_path": fp, "formation_energy": float(val), "error": None})
+                info["formation_energy"] = float(val)
+                results.append(info)
             except Exception as e:
-                results.append({"file_path": fp, "formation_energy": None, "error": str(e)})
+                # Catch per-structure errors
+                info["error"] = f"Prediction failed with error: {str(e)}"
+                results.append(info)
+
     except Exception as e:
-        results = [{"error": f"Worker crashed: {e}"}]
-    print(json.dumps(results))
+        # Catastrophic failure catch for the whole script (ImportError)
+        results = [{"error": f"Worker crashed (Import/Setup): {str(e)}", "file_path": "N/A"}]
+
+    print(json.dumps(results if results else []))
 
 if __name__ == "__main__": main()
