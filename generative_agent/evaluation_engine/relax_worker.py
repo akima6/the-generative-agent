@@ -1,6 +1,4 @@
 # generative_agent/evaluation_engine/relax_worker.py
-# Runs in current python environment (not conda)
-
 import sys
 import os
 import json
@@ -15,14 +13,13 @@ def main():
     results = []
     args = sys.argv[1:]
     
-    # Catch all errors and print them in the JSON output
     try:
         from pymatgen.core import Structure
         from pymatgen.io.cif import CifWriter
         import warnings
         warnings.filterwarnings("ignore")
         
-        # This is where the ImportError happened. matgl/ase/torch must be in path.
+        # This relies on matgl/ase being installed in the main environment
         from relaxer import Relaxer 
         
         if len(args) < 2:
@@ -33,7 +30,6 @@ def main():
         input_paths = args[1:]
         os.makedirs(output_dir, exist_ok=True)
 
-        # MatGL load happens inside Relaxer.__init__()
         relaxer = Relaxer()
 
         for fp in input_paths:
@@ -41,6 +37,7 @@ def main():
             try:
                 struct = Structure.from_file(fp)
                 
+                # --- SAFETY CHECK ---
                 if struct.density < 0.1 or len(struct) < 2: 
                     info["error"] = "Structure too sparse or too few atoms"
                     results.append(info)
@@ -62,7 +59,7 @@ def main():
                 results.append(info)
 
     except Exception as e:
-        # Catastrophic failure catch for the whole script (The MatGL ImportError was caught here)
+        # Catastrophic failure catch (ImportError, etc.)
         results = [{"error": f"Worker crashed (Import/Setup): {str(e)}", "input_file": "N/A"}]
 
     print(json.dumps(results if results else []))
