@@ -10,12 +10,17 @@ from crystalformer.src.wyckoff import mult_table, fc_mask_table
 def von_mises_logpdf(x, loc, kappa):
     """
     Computes log(VonMises(x | loc, kappa))
-    ...
+    x: (Batch, n_max, 1) or broadcastable
+    loc: (Batch, n_max, Kx)
+    kappa: (Batch, n_max, Kx)
     """
-    # CRITICAL FIX 1: Clamp kappa to prevent division by zero or NaN in Bessel function
-    kappa = torch.clamp(kappa, min=1e-8) # Increase numerical floor
+    # CRITICAL FIX: Clamp kappa to prevent numerical instability
+    kappa = torch.clamp(kappa, min=1e-8)
     
-    # ... (rest of the code)
+    # log(I0(k)) = k + log(I0e(k))
+    term1 = kappa * torch.cos(x.unsqueeze(-1) - loc) # (Batch, n_max, Kx)
+    term2 = -np.log(2 * np.pi)
+    term3 = -(kappa + torch.log(torch.special.i0e(kappa)))
     
     return term1 + term2 + term3
 
