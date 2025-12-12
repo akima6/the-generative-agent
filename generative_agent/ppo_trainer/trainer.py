@@ -7,6 +7,49 @@ import torch.optim as optim
 import numpy as np
 import pickle
 import copy
+import pandas as pd
+
+    LOG_CSV_PATH = os.path.join(PROJECT_ROOT, "discovery_log.csv")
+    if not os.path.exists(LOG_CSV_PATH):
+        # Create header
+        pd.DataFrame(columns=["Iteration", "Formula", "Density", "Reward", "Valid"]).to_csv(LOG_CSV_PATH, index=False)
+
+    # 3. THE TRAINING LOOP
+    for it in range(NUM_ITERATIONS):
+        # ... (Sampling and LogP steps remain same) ...
+
+        # --- STEP C: REALITY CHECK (Reward) ---
+        print("2. Converting to Physical Structures...")
+        structures = TensorBridge.batch_to_structures(G, L_real, XYZ, A, M)
+        
+        # === LOGGING BLOCK START ===
+        log_entries = []
+        for idx, struct in enumerate(structures):
+            if struct is not None:
+                formula = struct.composition.reduced_formula
+                density = struct.density
+                valid = True
+            else:
+                formula = "INVALID"
+                density = 0.0
+                valid = False
+            
+            # We don't have the exact reward per crystal yet, we calculate it next.
+            # But we can update the list after reward calculation.
+            log_entries.append({"Iteration": it+1, "Formula": formula, "Density": density, "Valid": valid})
+        # === LOGGING BLOCK END ===
+
+        print("3. Calculating Rewards...")
+        rewards_list = reward_calc.get_rewards(structures)
+        
+        # Add rewards to log and save
+        for i, entry in enumerate(log_entries):
+            entry["Reward"] = rewards_list[i]
+        
+        # Append to CSV
+        pd.DataFrame(log_entries).to_csv(LOG_CSV_PATH, mode='a', header=False, index=False)
+        print(f"   [LOG] Saved batch details to {LOG_CSV_PATH}")
+
 
 # --- SETUP PATHS ---
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -41,9 +84,9 @@ CONFIG_PATH = os.path.join(PROJECT_ROOT, "pretrained_model", "config.yaml")
 CHECKPOINT_PATH = os.path.join(PROJECT_ROOT, "pretrained_model", "epoch_005500.pt")
 
 # Training Hyperparameters - INCREASED ITERATIONS
-BATCH_SIZE = 4    
-PPO_EPOCHS = 2    
-NUM_ITERATIONS = 5# <-- INCREASED FOR MEANINGFUL RUN
+BATCH_SIZE = 16   
+PPO_EPOCHS = 4    
+NUM_ITERATIONS = 200# <-- INCREASED FOR MEANINGFUL RUN
 LR = 1e-5         
 CLIP_EPS = 0.2    
 BETA = 0.05       
