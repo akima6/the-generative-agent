@@ -23,10 +23,7 @@ CRYSTALFORMER_DIR = os.path.join(PROJECT_ROOT, "CrystalFormer")
 sys.path.insert(0, PROJECT_ROOT)
 sys.path.insert(0, CRYSTALFORMER_DIR)
 
-print("\n=== DEBUG: sys.path ===")
-for p in sys.path:
-    print(p)
-print("=======================\n")
+
 
 # --- CRYSTALFORMER IMPORTS ---
 from crystalformer.src.transformer import make_transformer
