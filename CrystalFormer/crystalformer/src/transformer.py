@@ -44,7 +44,6 @@ class HaikuMultiHeadAttention(nn.Module):
         scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
         
         if mask is not None:
-            # mask expected shape broadcastable to (B, H, L, L)
             scores = scores + mask
             
         probs = F.softmax(scores, dim=-1)
@@ -63,36 +62,24 @@ class TransformerBlock(nn.Module):
         super().__init__()
         self.ln1 = nn.LayerNorm(model_size)
         self.ln2 = nn.LayerNorm(model_size)
-
-        # USE CUSTOM ATTENTION
         self.attn = HaikuMultiHeadAttention(num_heads, key_size, model_size, dropout_rate)
-        
         self.mlp = nn.Sequential(
             nn.Linear(model_size, widening_factor * model_size),
             nn.GELU(),
             nn.Linear(widening_factor * model_size, model_size)
         )
-        
         self.dropout = nn.Dropout(dropout_rate)
 
     def forward(self, x, mask=None, is_train=True):
         h_norm = self.ln1(x)
-        # Pass mask directly
         attn_out = self.attn(h_norm, h_norm, h_norm, mask=mask)
-        
-        if is_train:
-            attn_out = self.dropout(attn_out)
-        
+        if is_train: attn_out = self.dropout(attn_out)
         x = x + attn_out
 
         h_norm = self.ln2(x)
         mlp_out = self.mlp(h_norm)
-        
-        if is_train:
-            mlp_out = self.dropout(mlp_out)
-            
+        if is_train: mlp_out = self.dropout(mlp_out)
         x = x + mlp_out
-        
         return x
 
 class CrystalTransformer(nn.Module):
@@ -131,6 +118,8 @@ class CrystalTransformer(nn.Module):
 
         self.fc_hW = nn.Linear(2 * embed_size + 1, model_size)
         self.fc_hA = nn.Linear(2 * embed_size, model_size)
+        
+        # --- UPDATE: Split Coordinate Projections (Matches JAX Linear_4, 5, 6) ---
         self.fc_hX = nn.Linear(embed_size + 2 * Nf, model_size)
         self.fc_hY = nn.Linear(embed_size + 2 * Nf, model_size)
         self.fc_hZ = nn.Linear(embed_size + 2 * Nf, model_size)
@@ -146,10 +135,8 @@ class CrystalTransformer(nn.Module):
     def renormalize_coord(self, h_x):
         relevant = h_x[..., :self.coord_types]
         x_logit, x_loc, x_kappa = torch.split(relevant, [self.Kx, self.Kx, self.Kx], dim=-1)
-        
         x_logit = torch.log_softmax(x_logit, dim=-1)
         x_kappa = F.softplus(x_kappa)
-        
         padding = torch.zeros(h_x.shape[:-1] + (self.output_size - self.coord_types,), device=h_x.device)
         return torch.cat([x_logit, x_loc, x_kappa, padding], dim=-1)
 
@@ -219,6 +206,7 @@ class CrystalTransformer(nn.Module):
         hY_f = fourier_encode(Y, self.Nf)
         hZ_f = fourier_encode(Z, self.Nf)
         
+        # --- UPDATE: Use Split Coordinate Projections ---
         hX = self.fc_hX(torch.cat([g_emb_exp, hX_f], dim=-1))
         hY = self.fc_hY(torch.cat([g_emb_exp, hY_f], dim=-1))
         hZ = self.fc_hZ(torch.cat([g_emb_exp, hZ_f], dim=-1))
