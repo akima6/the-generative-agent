@@ -131,7 +131,9 @@ class CrystalTransformer(nn.Module):
 
         self.fc_hW = nn.Linear(2 * embed_size + 1, model_size)
         self.fc_hA = nn.Linear(2 * embed_size, model_size)
-        self.fc_hXYZ = nn.Linear(embed_size + 2 * Nf, model_size)
+        self.fc_hX = nn.Linear(embed_size + 2 * Nf, model_size)
+        self.fc_hY = nn.Linear(embed_size + 2 * Nf, model_size)
+        self.fc_hZ = nn.Linear(embed_size + 2 * Nf, model_size)
 
         self.layers = nn.ModuleList([
             TransformerBlock(num_heads, key_size, model_size, attn_dropout, widening_factor)
@@ -217,9 +219,9 @@ class CrystalTransformer(nn.Module):
         hY_f = fourier_encode(Y, self.Nf)
         hZ_f = fourier_encode(Z, self.Nf)
         
-        hX = self.fc_hXYZ(torch.cat([g_emb_exp, hX_f], dim=-1))
-        hY = self.fc_hXYZ(torch.cat([g_emb_exp, hY_f], dim=-1))
-        hZ = self.fc_hXYZ(torch.cat([g_emb_exp, hZ_f], dim=-1))
+        hX = self.fc_hX(torch.cat([g_emb_exp, hX_f], dim=-1))
+        hY = self.fc_hY(torch.cat([g_emb_exp, hY_f], dim=-1))
+        hZ = self.fc_hZ(torch.cat([g_emb_exp, hZ_f], dim=-1))
         
         h = torch.stack([hW, hA, hX, hY, hZ], dim=2)
         h = h.reshape(batch_size, 5 * n_atoms, self.model_size)
