@@ -29,7 +29,7 @@ from generative_agent.ppo_trainer.bridge import TensorBridge
 
 # --- CONFIGURATION ---
 CONFIG_PATH = os.path.join(PROJECT_ROOT, "pretrained_model", "config.yaml")
-CHECKPOINT_PATH = os.path.join(PROJECT_ROOT, "pretrained_model", "epoch_005500.pt")
+CHECKPOINT_PATH = os.path.join(PROJECT_ROOT, "pretrained_model", "epoch_005500_FIXED.pt")
 LOG_CSV_PATH = os.path.join(PROJECT_ROOT, "discovery_log.csv")
 
 # --- HYPERPARAMETERS (DISCOVERY MODE) ---
