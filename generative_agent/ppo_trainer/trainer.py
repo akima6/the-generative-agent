@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import copy
 import time
+from pymatgen.core import Element
 
 # --- SETUP PATHS ---
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -28,23 +29,52 @@ from generative_agent.ppo_trainer.bridge import TensorBridge
 
 # --- CONFIGURATION ---
 CONFIG_PATH = os.path.join(PROJECT_ROOT, "pretrained_model", "config.yaml")
-# Ensure we use the CALIBRATED checkpoint (epoch_005500.pt)
 CHECKPOINT_PATH = os.path.join(PROJECT_ROOT, "pretrained_model", "epoch_005500.pt")
 LOG_CSV_PATH = os.path.join(PROJECT_ROOT, "discovery_log.csv")
 
-# --- HYPERPARAMETERS (STABILIZED) ---
+# --- HYPERPARAMETERS ---
 BATCH_SIZE = 16
 PPO_EPOCHS = 4
-NUM_ITERATIONS = 500 # Run longer, but safer
-LR = 5e-6            # Lower LR to prevent explosion
+NUM_ITERATIONS = 200
+LR = 5e-6
 CLIP_EPS = 0.2
 BETA = 0.05
 SPACE_GROUP = 225
-TEMP = 1.0
+TEMP = 1.5 # High temp for exploration
+
+# --- ELEMENT UNIVERSE (TARGET LIST) ---
+# Symbols provided by user
+ELEMENT_SYMBOLS = [
+    "B", "C", "N", "O", "F",
+    "Al", "Si", "P", "S", "Cl",
+    "Ga", "Ge", "As", "Se", "Br",
+    "In", "Sn", "Sb", "Te", "I",
+    "Be", "Mg", "Ca", "Sr", "Ba",
+    "Sc", "Ti", "V", "Cr", "Mn", "Fe", "Co", "Ni", "Cu", "Zn",
+    "Y", "Zr", "Nb", "Mo", "Hf", "Ta", "W", "Re", "Os"
+]
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 if DEVICE.type == 'cpu' and 'cuda' in os.environ.get('ACCELERATOR_TYPE', '').lower():
     DEVICE = torch.device("cuda:0")
+
+def get_atom_mask(atom_types, device):
+    """Creates a boolean mask allowing only the selected elements."""
+    mask = torch.zeros((atom_types,), device=device)
+    mask[0] = 1.0 # Always allow padding (0)
+    
+    count = 0
+    for sym in ELEMENT_SYMBOLS:
+        try:
+            z = Element(sym).Z
+            if z < atom_types:
+                mask[z] = 1.0
+                count += 1
+        except:
+            pass
+    print(f"--- ATOM MASK CREATED ---")
+    print(f"Allowed {count} elements from the provided Universe list.")
+    return mask
 
 def load_system():
     print(f"Loading Config from {CONFIG_PATH}")
@@ -69,22 +99,25 @@ def load_system():
             if 'model_state_dict' in ckpt: transformer.load_state_dict(ckpt['model_state_dict'])
             else: transformer.load_state_dict(ckpt)
         except Exception as e:
-            print(f"WARNING: Could not load checkpoint: {e}")
-            print("Starting from scratch (or random weights)!")
+            print(f"WARNING: Checkpoint load failed: {e}")
     else:
         print(f"WARNING: Checkpoint not found at {CHECKPOINT_PATH}")
 
     return config, transformer
 
 def main():
-    print("--- STARTING NOVAGEN DISCOVERY ENGINE (STABILIZED) ---")
+    print("--- STARTING NOVAGEN DISCOVERY ENGINE (FINAL) ---")
     
     config, transformer = load_system()
     reward_calc = RewardCalculator()
     
-    # Init Log
+    # Initialize Log with new Columns
     if not os.path.exists(LOG_CSV_PATH):
-        pd.DataFrame(columns=["Iteration", "Formula", "Density", "Reward", "Valid"]).to_csv(LOG_CSV_PATH, index=False)
+        columns = [
+            "Iteration", "Formula", "Density", "Reward", "Valid",
+            "Initial_Energy", "Final_Energy", "Band_Gap", "Formation_Energy"
+        ]
+        pd.DataFrame(columns=columns).to_csv(LOG_CSV_PATH, index=False)
 
     # Setup PPO
     transformer_pretrain = copy.deepcopy(transformer)
@@ -96,10 +129,13 @@ def main():
     _, logp_fn = make_loss_fn(config['n_max'], config['atom_types'], config['wyck_types'], config['Kx'], config['Kl'], transformer)
     ppo_loss_calc = make_ppo_loss_fn(logp_fn, CLIP_EPS, BETA)
     
-    atom_mask = torch.zeros((config['n_max'], config['atom_types']), device=DEVICE) 
-    constraints = torch.arange(config['n_max'], device=DEVICE)
+    # APPLY ELEMENT MASK
+    valid_elements_mask = get_atom_mask(config['atom_types'], DEVICE)
+    # Expand for batching
+    # atom_mask shape expected: (n_max, atom_types)
+    atom_mask = valid_elements_mask.unsqueeze(0).expand(config['n_max'], -1)
     
-    # Initialize baseline with the failure value to dampen initial shock
+    constraints = torch.arange(config['n_max'], device=DEVICE)
     global_baseline = -5.0
 
     print(f"\n--- BEGINNING {NUM_ITERATIONS} ITERATION RUN ---")
@@ -115,12 +151,11 @@ def main():
                     n_max=config['n_max'], batchsize=BATCH_SIZE,
                     atom_types=config['atom_types'], wyck_types=config['wyck_types'],
                     Kx=config['Kx'], Kl=config['Kl'], g=SPACE_GROUP,
-                    w_mask=None, atom_mask=None, top_p=1.0, temperature=TEMP, T1=TEMP,
+                    w_mask=None, atom_mask=atom_mask, top_p=1.0, temperature=TEMP, T1=TEMP,
                     constraints=constraints
                 )
         except RuntimeError as e:
-            print(f"RuntimeError during sampling: {e}")
-            print("Skipping batch to avoid crash...")
+            print(f"Sampling Error: {e}")
             continue
 
         G = torch.full((BATCH_SIZE,), SPACE_GROUP, device=DEVICE)
@@ -134,33 +169,44 @@ def main():
             pp_w, pp_xyz, pp_a, pp_l = logp_fn(transformer_pretrain, G, L_norm, XYZ, A, W, is_train=False)
             pretrain_logp = pp_w + pp_xyz + pp_a + pp_l
 
-        # --- C. REWARD ---
+        # --- C. REWARD & LOGGING ---
         structures = TensorBridge.batch_to_structures(G, L_real, XYZ, A, M)
         
-        log_entries = []
-        for s in structures:
-            if s: log_entries.append({"Iteration": it+1, "Formula": s.composition.reduced_formula, "Density": s.density, "Valid": True})
-            else: log_entries.append({"Iteration": it+1, "Formula": "INVALID", "Density": 0.0, "Valid": False})
-
+        # Calculate Rewards (and fill stats)
         rewards_list = reward_calc.get_rewards(structures)
         rewards_tensor = torch.tensor(rewards_list, device=DEVICE, dtype=torch.float32)
         
-        for i, entry in enumerate(log_entries): entry["Reward"] = rewards_list[i]
-        pd.DataFrame(log_entries).to_csv(LOG_CSV_PATH, mode='a', header=False, index=False)
+        # Construct Log Data
+        batch_logs = []
+        stats = reward_calc.last_batch_stats # Get the rich data from reward.py
+        
+        for i, s in enumerate(structures):
+            entry = {
+                "Iteration": it+1,
+                "Formula": stats[i].get('formula', "INVALID"),
+                "Density": s.density if s else 0.0,
+                "Reward": rewards_list[i],
+                "Valid": stats[i].get('valid', False),
+                "Initial_Energy": stats[i].get('initial_E'),
+                "Final_Energy": stats[i].get('final_E'),
+                "Band_Gap": stats[i].get('band_gap'),
+                "Formation_Energy": stats[i].get('formation_E')
+            }
+            batch_logs.append(entry)
+            
+        pd.DataFrame(batch_logs).to_csv(LOG_CSV_PATH, mode='a', header=False, index=False)
         
         # Stats
         avg_reward = rewards_tensor.mean().item()
         max_reward = rewards_tensor.max().item()
-        
-        # Update Baseline
         global_baseline = 0.9 * global_baseline + 0.1 * avg_reward 
         
-        # STABILITY FIX 1: Advantage Normalization
+        # Advantages
         raw_advantages = rewards_tensor - global_baseline
         if raw_advantages.std() > 1e-5:
             advantages = (raw_advantages - raw_advantages.mean()) / (raw_advantages.std() + 1e-8)
         else:
-            advantages = raw_advantages # Keep raw if variance is 0 (all -5.0)
+            advantages = raw_advantages
         
         # --- D. UPDATE ---
         transformer.train()
@@ -173,31 +219,26 @@ def main():
             optimizer.zero_grad()
             loss, kl = ppo_loss_calc(transformer, x_data, old_logp, pretrain_logp, advantages)
             
-            # STABILITY FIX 2: Circuit Breaker
-            if torch.isnan(loss) or torch.abs(loss) > 10.0:
-                print(f"   [WARNING] Loss explosion detected ({loss.item()}). Skipping update.")
+            if torch.isnan(loss) or torch.abs(loss) > 20.0:
                 skipped = True
                 break
                 
             loss.backward()
-            # STABILITY FIX 3: Tighter Clipping
             torch.nn.utils.clip_grad_norm_(transformer.parameters(), 0.5)
             optimizer.step()
             total_loss += loss.item()
             
         iter_time = time.time() - iter_start
         status_symbol = "✅" if max_reward > -4.0 else "❌"
+        loss_str = f"{total_loss/PPO_EPOCHS:.4f}" if not skipped else "SKIP"
         
-        loss_str = f"{total_loss/PPO_EPOCHS:.4f}" if not skipped else "SKIPPED"
         print(f"Iter {it+1}/{NUM_ITERATIONS} [{status_symbol}] | "
               f"Reward: {avg_reward:.2f} (Max: {max_reward:.2f}) | "
               f"Loss: {loss_str} | Time: {iter_time:.1f}s")
 
-    # SAVE
     print("\n--- DISCOVERY RUN COMPLETE ---")
-    save_path = os.path.join(PROJECT_ROOT, "pretrained_model", "finetuned_semiconductor.pt")
-    torch.save(transformer.state_dict(), save_path)
-    print(f"Model saved to: {save_path}")
+    torch.save(transformer.state_dict(), os.path.join(PROJECT_ROOT, "pretrained_model", "finetuned_semiconductor.pt"))
+    print(f"Full Data Log: {LOG_CSV_PATH}")
 
 if __name__ == "__main__":
     main()
