@@ -11,12 +11,11 @@ class TensorBridge:
     Handles the conversion between PyTorch Tensors and Pymatgen Structures.
     """
     
-    # --- PHYSICS PATCH: AGGRESSIVE COMPRESSION ---
-    # The model outputs lattices ~2.5x too large. 
-    # We apply a 0.4 scaling factor. 
-    # Effect: Increases density by approx 15x (1/0.4^3).
-    # Target: Turn 0.2 g/cm3 -> 3.0 g/cm3.
-    LATTICE_SCALING_FACTOR = 1.0 
+    # --- PHYSICS PATCH: EXPANSION MODE ---
+    # The crystals are currently too dense (~5.3 g/cm3 vs 2.2 g/cm3).
+    # MatGL fails because atoms are overlapping.
+    # We expand the lattice by 35% to reduce density.
+    LATTICE_SCALING_FACTOR = 1.35
 
     @staticmethod
     def _to_numpy(x):
@@ -41,28 +40,23 @@ class TensorBridge:
                 )
                 structures.append(struct)
             except Exception as e:
-                # print(f"[Bridge Error] {e}") 
                 structures.append(None)
                 
         return structures
 
     @staticmethod
     def _single_to_structure(g, l_params, xyz, a, m):
-        # 1. Apply Physics Patch
         l_params = l_params.copy()
+        
+        # Apply Scaling Patch
         l_params[:3] = l_params[:3] * TensorBridge.LATTICE_SCALING_FACTOR
         
-        # 2. Validation
-        # Check for NaNs or zero volume
         if np.isnan(l_params).any(): raise ValueError("NaN Lattice")
-        if np.any(l_params[:3] <= 0.5): raise ValueError("Lattice collapsed (too small)")
+        if np.any(l_params[:3] <= 0.5): raise ValueError("Lattice collapsed")
         
-        # 3. Reconstruct Lattice
         lattice = Lattice.from_parameters(*l_params)
         
-        # 4. Filter Valid Atoms
         valid_indices = np.where((m > 0) & (a > 0))[0]
-        
         species = []
         coords = []
         
