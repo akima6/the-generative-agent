@@ -4,7 +4,6 @@ import torch
 from pymatgen.core import Structure, Lattice, Element
 import warnings
 
-# Suppress pymatgen warnings
 warnings.filterwarnings("ignore")
 
 class TensorBridge:
@@ -12,11 +11,12 @@ class TensorBridge:
     Handles the conversion between PyTorch Tensors and Pymatgen Structures.
     """
     
-    # --- PHYSICS PATCH: THE COMPRESSOR ---
-    # The model currently outputs lattices that are ~1.7x too large (Gas Density).
-    # We apply a global correction to shrink them into the solid phase.
-    # 0.6 * Length = ~4.6x Density Increase.
-    LATTICE_SCALING_FACTOR = 0.55 
+    # --- PHYSICS PATCH: AGGRESSIVE COMPRESSION ---
+    # The model outputs lattices ~2.5x too large. 
+    # We apply a 0.4 scaling factor. 
+    # Effect: Increases density by approx 15x (1/0.4^3).
+    # Target: Turn 0.2 g/cm3 -> 3.0 g/cm3.
+    LATTICE_SCALING_FACTOR = 0.40 
 
     @staticmethod
     def _to_numpy(x):
@@ -26,7 +26,6 @@ class TensorBridge:
 
     @staticmethod
     def batch_to_structures(G, L, XYZ, A, M):
-        # Convert Torch tensors to standard Numpy arrays
         G_np = TensorBridge._to_numpy(G)
         L_np = TensorBridge._to_numpy(L)
         XYZ_np = TensorBridge._to_numpy(XYZ)
@@ -42,25 +41,23 @@ class TensorBridge:
                 )
                 structures.append(struct)
             except Exception as e:
-                # print(f"[Bridge Error] {e}") # Optional logging
+                # print(f"[Bridge Error] {e}") 
                 structures.append(None)
                 
         return structures
 
     @staticmethod
     def _single_to_structure(g, l_params, xyz, a, m):
-        # 1. Apply Physics Patch (Compress Lattice)
-        # l_params is [a, b, c, alpha, beta, gamma]
-        # We only scale a, b, c (indices 0, 1, 2)
+        # 1. Apply Physics Patch
         l_params = l_params.copy()
         l_params[:3] = l_params[:3] * TensorBridge.LATTICE_SCALING_FACTOR
         
         # 2. Validation
+        # Check for NaNs or zero volume
         if np.isnan(l_params).any(): raise ValueError("NaN Lattice")
-        if np.any(l_params[:3] <= 0.1): raise ValueError("Lattice too small")
+        if np.any(l_params[:3] <= 0.5): raise ValueError("Lattice collapsed (too small)")
         
         # 3. Reconstruct Lattice
-        # Pymatgen expects degrees for angles (which sample.py provides)
         lattice = Lattice.from_parameters(*l_params)
         
         # 4. Filter Valid Atoms
