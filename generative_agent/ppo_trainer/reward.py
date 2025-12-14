@@ -5,7 +5,6 @@ import numpy as np
 import tempfile
 import subprocess
 import json
-import configparser
 from pymatgen.io.cif import CifWriter
 from pathlib import Path
 
@@ -14,51 +13,33 @@ CURRENT_DIR = Path(__file__).parent.resolve()
 PROJECT_ROOT = CURRENT_DIR.parent.parent
 sys.path.append(str(PROJECT_ROOT))
 
-# Paths from file
-ENV_PATH_FILE = PROJECT_ROOT / "env_paths.txt"
+# Path to the relaxer script
 RELAXER_SCRIPT = PROJECT_ROOT / "generative_agent" / "evaluation_engine" / "relax_worker.py"
 
 from generative_agent.evaluation_engine.oracle import Oracle
 
-# Load environment paths
-MATGL_ENV_PATH = None
-MEGNET_ENV_PATH = None
-
-def load_env_paths():
-    global MATGL_ENV_PATH, MEGNET_ENV_PATH
-    config = configparser.ConfigParser()
-    try:
-        with open(ENV_PATH_FILE, 'r') as f:
-            data = dict(line.strip().split('=', 1) for line in f)
-        MATGL_ENV_PATH = data.get('ENV_B_PATH')
-        MEGNET_ENV_PATH = data.get('ENV_C_PATH')
-    except Exception as e:
-        print(f"[Reward] Warning: Could not load env paths: {e}")
-
-load_env_paths()
-
 class RewardCalculator:
     def __init__(self):
-        print("[RewardCalculator] Initializing...")
-        self.oracle = Oracle(matgl_env_name=MATGL_ENV_PATH, megnet_env_name=MEGNET_ENV_PATH)
+        print("[RewardCalculator] Initializing (Single-Env Mode)...")
+        # No paths needed for single-env
+        self.oracle = Oracle()
         self.relaxer_script = str(RELAXER_SCRIPT)
         
-        # This list will hold dictionaries of details for the most recent batch
-        # Keys: 'formula', 'initial_E', 'final_E', 'band_gap', 'formation_E', 'valid'
+        # Stats container
         self.last_batch_stats = []
 
     def get_rewards(self, structures: list) -> list:
         """
-        Calculates rewards and populates self.last_batch_stats with detailed logs.
+        Calculates rewards and populates self.last_batch_stats.
         """
-        self.last_batch_stats = [] # Reset stats
+        self.last_batch_stats = [] 
         
         if not structures:
             return []
 
         rewards = [-5.0] * len(structures)
         
-        # Initialize stats with defaults
+        # Initialize stats
         for s in structures:
             stat = {
                 "formula": s.composition.reduced_formula if s else "INVALID",
@@ -87,7 +68,7 @@ class RewardCalculator:
                 stable_structures.append(res["structure"])
                 stable_indices.append(i)
             elif res:
-                # Even if failed, log energies if available
+                # Log energies even on failure
                 self.last_batch_stats[i]["initial_E"] = res.get("initial_energy")
                 self.last_batch_stats[i]["final_E"] = res.get("final_energy")
 
@@ -111,23 +92,20 @@ class RewardCalculator:
                 # Target: Ef < 0 (Stable) AND 0.5 < Eg < 3.0 (Semiconductor)
                 
                 # Stability Score
-                if ef > 0: 
+                if ef > 0.0: 
                     r_stability = -5.0 # Unstable
                 else:
-                    # Bonus for being very stable (up to 2.0)
+                    # Bonus for being stable (0 to 2.0)
                     r_stability = min(2.0, -1.0 * ef)
 
                 # Band Gap Score (Gaussian centered at 1.5 eV)
-                # 0.5 to 3.0 is the acceptance window
                 if 0.5 < eg < 3.0:
-                    # Peak at 1.5 eV
                     r_electronic = 5.0 * np.exp(-((eg - 1.5)**2) / (2 * 0.5**2))
                 else:
-                    r_electronic = -2.0 # Penalty for being Metal or Insulator
+                    r_electronic = -2.0 # Penalty for missed target
 
                 total_score = r_stability + r_electronic
                 
-                # Clamp
                 final_score = max(-5.0, min(10.0, total_score))
                 
                 rewards[idx] = final_score
@@ -152,7 +130,8 @@ class RewardCalculator:
             
             if not cifs: return results
 
-            cmd = ["conda", "run", "-p", MATGL_ENV_PATH, "python", self.relaxer_script, tmp_out] + cifs
+            # CHANGE: Use sys.executable instead of conda run
+            cmd = [sys.executable, self.relaxer_script, tmp_out] + cifs
             
             try:
                 proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
@@ -178,7 +157,11 @@ class RewardCalculator:
                             res_entry["is_converged"] = False
                             
                     results[idx] = res_entry
+            except subprocess.CalledProcessError as e:
+                print(f"[Reward] Relaxer Subprocess Failed.")
+                print(f"STDOUT: {e.stdout}")
+                print(f"STDERR: {e.stderr}")
             except Exception as e:
-                print(f"[Reward] Relaxer failed: {e}")
+                print(f"[Reward] Relaxer Exception: {e}")
                 
         return results
