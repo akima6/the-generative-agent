@@ -16,7 +16,7 @@ class TensorBridge:
     # We apply a 0.4 scaling factor. 
     # Effect: Increases density by approx 15x (1/0.4^3).
     # Target: Turn 0.2 g/cm3 -> 3.0 g/cm3.
-    LATTICE_SCALING_FACTOR = 0.40 
+    LATTICE_SCALING_FACTOR = 1.0 
 
     @staticmethod
     def _to_numpy(x):
