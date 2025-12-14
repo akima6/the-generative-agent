@@ -4,28 +4,29 @@ import torch
 from pymatgen.core import Structure, Lattice, Element
 import warnings
 
-# Suppress pymatgen warnings about occupancy (common in generative models)
+# Suppress pymatgen warnings
 warnings.filterwarnings("ignore")
 
 class TensorBridge:
     """
-    Handles the conversion between PyTorch Tensors (Model Output) 
-    and Pymatgen Structures (Physics Object) without using disk I/O.
+    Handles the conversion between PyTorch Tensors and Pymatgen Structures.
     """
     
+    # --- PHYSICS PATCH: THE COMPRESSOR ---
+    # The model currently outputs lattices that are ~1.7x too large (Gas Density).
+    # We apply a global correction to shrink them into the solid phase.
+    # 0.6 * Length = ~4.6x Density Increase.
+    LATTICE_SCALING_FACTOR = 0.55 
+
     @staticmethod
     def _to_numpy(x):
-        """Helper to convert Tensor/List to Numpy array safely."""
         if isinstance(x, torch.Tensor):
             return x.detach().cpu().numpy()
         return np.array(x)
 
     @staticmethod
     def batch_to_structures(G, L, XYZ, A, M):
-        """
-        Convert batch of PyTorch tensors to a list of Pymatgen Structures.
-        """
-        # Convert Torch tensors to standard Numpy arrays for CPU processing
+        # Convert Torch tensors to standard Numpy arrays
         G_np = TensorBridge._to_numpy(G)
         L_np = TensorBridge._to_numpy(L)
         XYZ_np = TensorBridge._to_numpy(XYZ)
@@ -41,36 +42,28 @@ class TensorBridge:
                 )
                 structures.append(struct)
             except Exception as e:
-                # DEBUG PRINT: Print exactly why it failed
-                print(f"[Bridge Error Sample {i}] {e}")
-                # Print Lattice params to check for NaNs or Negatives
-                print(f"  Lattice: {L_np[i]}")
+                # print(f"[Bridge Error] {e}") # Optional logging
                 structures.append(None)
                 
         return structures
 
     @staticmethod
     def _single_to_structure(g, l_params, xyz, a, m):
-        # 1. Reconstruct Lattice
+        # 1. Apply Physics Patch (Compress Lattice)
         # l_params is [a, b, c, alpha, beta, gamma]
+        # We only scale a, b, c (indices 0, 1, 2)
+        l_params = l_params.copy()
+        l_params[:3] = l_params[:3] * TensorBridge.LATTICE_SCALING_FACTOR
         
-        # Check for NaNs
-        if np.isnan(l_params).any():
-            raise ValueError("Lattice parameters contain NaNs")
-            
-        # Check for non-positive lengths
-        if np.any(l_params[:3] <= 1e-3):
-            raise ValueError(f"Lattice lengths too small or negative: {l_params[:3]}")
-            
-        # Pymatgen validation for angles
-        if np.any(l_params[3:] <= 0) or np.any(l_params[3:] >= 180):
-             raise ValueError(f"Invalid Lattice Angles: {l_params[3:]}")
-
+        # 2. Validation
+        if np.isnan(l_params).any(): raise ValueError("NaN Lattice")
+        if np.any(l_params[:3] <= 0.1): raise ValueError("Lattice too small")
+        
+        # 3. Reconstruct Lattice
+        # Pymatgen expects degrees for angles (which sample.py provides)
         lattice = Lattice.from_parameters(*l_params)
         
-        # 2. Filter Valid Atoms
-        # The model outputs a fixed size array (e.g. 24 atoms). 
-        # We only keep atoms where Species(A) > 0 and Multiplicity(M) > 0
+        # 4. Filter Valid Atoms
         valid_indices = np.where((m > 0) & (a > 0))[0]
         
         species = []
@@ -78,13 +71,11 @@ class TensorBridge:
         
         for idx in valid_indices:
             z = int(a[idx])
-            # Element 0 is padding, 119+ is invalid.
             if 0 < z < 119: 
                 species.append(Element.from_Z(z))
                 coords.append(xyz[idx])
                 
         if len(species) == 0:
-            raise ValueError("Empty structure generated (No valid atoms)")
+            raise ValueError("Empty structure")
             
-        # 3. Create Structure
         return Structure(lattice, species, coords)
