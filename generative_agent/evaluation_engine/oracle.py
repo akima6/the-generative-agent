@@ -10,7 +10,8 @@ from pymatgen.io.cif import CifWriter
 
 class Oracle:
     def __init__(self, matgl_env_name=None, megnet_env_name=None):
-        # Env names are kept for interface compatibility but ignored
+        # We accept the args to keep compatibility with old code, 
+        # but we ignore them in the Single-Env setup.
         
         # Locate workers relative to this file
         current_dir = Path(__file__).parent
@@ -18,16 +19,22 @@ class Oracle:
         self.bg_script = current_dir / "workers" / "predict_band_gap.py"
 
     def _run_worker(self, script, cifs):
-        # FIX: Execute directly with current Python instead of Conda
+        """
+        Runs the worker script using the CURRENT Python environment.
+        """
+        # CMD: python script.py file1.cif file2.cif ...
         cmd = [sys.executable, str(script)] + cifs
+        
         try:
             res = subprocess.run(cmd, capture_output=True, text=True, check=True)
             return json.loads(res.stdout)
+        except subprocess.CalledProcessError as e:
+            print(f"[Oracle Error] Worker {script.name} failed.")
+            print(f"STDOUT: {e.stdout}")
+            print(f"STDERR: {e.stderr}")
+            return []
         except Exception as e:
-            print(f"Bridge Error ({script.name}): {e}")
-            # If failed, return empty to handle gracefully
-            if 'res' in locals(): 
-                print(f"Stderr: {res.stderr[:200]}") # Print first 200 chars of error
+            print(f"[Oracle Error] Unexpected: {e}")
             return []
 
     def predict_properties(self, structures):
@@ -35,30 +42,26 @@ class Oracle:
         
         with tempfile.TemporaryDirectory() as tmp:
             cifs = []
-            valid_indices = []
-            
-            # Write CIFs
             for i, s in enumerate(structures):
                 p = os.path.join(tmp, f"{i}.cif")
-                try:
-                    CifWriter(s).write_file(p)
-                    cifs.append(p)
-                    valid_indices.append(i)
-                except:
-                    pass
+                CifWriter(s).write_file(p)
+                cifs.append(p)
             
-            if not cifs: return []
-
-            # Run workers
-            # We run them sequentially on the current GPU/CPU
+            # Run Formation Energy Worker (MatGL)
             fe_res = self._run_worker(self.fe_script, cifs)
+            
+            # Run Band Gap Worker (MEGNET)
             bg_res = self._run_worker(self.bg_script, cifs)
             
-            # Map results back to file paths
+            # Map results
             fe_map = {r.get("file_path"): r for r in fe_res}
             bg_map = {r.get("file_path"): r for r in bg_res}
             
             final = []
-            # match input structure order
-            # Note: The logic in RewardCalculator iterates over the *returned* list
-            # corresponding to the *stable_structures* list passed in.
+            for p in cifs:
+                final.append({
+                    "formation_energy": fe_map.get(p, {}).get("formation_energy"),
+                    "band_gap": bg_map.get(p, {}).get("band_gap"),
+                    "error": fe_map.get(p, {}).get("error") or bg_map.get(p, {}).get("error")
+                })
+            return final
