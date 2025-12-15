@@ -1,40 +1,63 @@
 # generative_agent/evaluation_engine/workers/predict_band_gap.py
-import sys, json, os
+import sys
+import os
+import json
+import warnings
+
+# Suppress TensorFlow logging and warnings
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+warnings.filterwarnings("ignore")
 
 def main():
+    input_cifs = sys.argv[1:]
     results = []
-    args = sys.argv[1:]
-    
-    sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+    if not input_cifs:
+        print(json.dumps([]))
+        return
 
     try:
-        # Megnet/TF setup
-        import warnings, logging
-        warnings.simplefilter("ignore")
-        os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-        logging.getLogger("megnet").setLevel(logging.CRITICAL)
-        
-        import tensorflow as tf
+        # Import inside main to catch environment errors cleanly
         from megnet.utils.models import load_model
         from pymatgen.core import Structure
-        
-        # Load the latest stable model
-        model = load_model("Bandgap_MP_2020") 
-        
-        for fp in args:
-            info = {"file_path": fp, "band_gap": None, "error": None}
+        import numpy as np
+
+        # --- LOAD MODEL (Exactly like your old script) ---
+        # The 'Bandgap_MP_2018' model is the standard MEGNET pre-trained model
+        model = load_model("Bandgap_MP_2018")
+
+        for cif_path in input_cifs:
+            entry = {"file_path": cif_path}
             try:
-                s = Structure.from_file(fp)
-                val = model.predict_structure(s).ravel()[0]
-                info["band_gap"] = float(val)
-                results.append(info)
+                if not os.path.exists(cif_path):
+                    entry["error"] = "File not found"
+                    results.append(entry)
+                    continue
+
+                structure = Structure.from_file(cif_path)
+                
+                # Predict
+                # MEGNET returns a numpy scalar/array
+                prediction = model.predict_structure(structure)
+                
+                # Handle numpy types for JSON serialization
+                if isinstance(prediction, (np.ndarray, list)):
+                    val = float(prediction.ravel()[0])
+                else:
+                    val = float(prediction)
+                
+                entry["band_gap"] = val
+                
             except Exception as e:
-                info["error"] = f"Prediction failed with error: {str(e)}"
-                results.append(info)
+                entry["error"] = str(e)
+            
+            results.append(entry)
 
     except Exception as e:
-        results = [{"error": f"Worker crashed (Import/Setup): {str(e)}", "file_path": "N/A"}]
+        results = [{"error": f"CRITICAL MEGNET FAILURE: {str(e)}"}]
 
-    print(json.dumps(results if results else []))
+    # Return JSON to the Oracle
+    print(json.dumps(results))
 
-if __name__ == "__main__": main()
+if __name__ == "__main__":
+    main()
