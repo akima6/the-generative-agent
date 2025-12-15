@@ -1,36 +1,61 @@
 # generative_agent/evaluation_engine/workers/predict_formation_energy.py
-import sys, json, os
+import sys
+import os
+import json
+import warnings
+
+# Suppress warnings for clean JSON output
+warnings.filterwarnings("ignore")
 
 def main():
+    # Input: List of CIF file paths
+    input_cifs = sys.argv[1:]
     results = []
-    args = sys.argv[1:]
-    
-    sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+    if not input_cifs:
+        print(json.dumps([]))
+        return
 
     try:
-        import warnings
-        warnings.filterwarnings("ignore")
         import matgl
         from pymatgen.core import Structure
+        import torch
+
+        # Force CPU if needed, or use CUDA if available
+        # MatGL handles this, but we suppress DGL warnings
         
-        # Using a newer, highly stable MatGL model for formation energy
-        model = matgl.load_model("M3GNet-MP-2021.2.8-Eform")
+        # --- LOAD MODEL (Exactly like your old script) ---
+        # We use the Eform model specifically for accurate energy prediction
+        model = matgl.load_model("M3GNet-MP-2018.6.1-Eform")
         
-        for fp in args:
-            info = {"file_path": fp, "formation_energy": None, "error": None}
+        for cif_path in input_cifs:
+            entry = {"file_path": cif_path}
             try:
-                s = Structure.from_file(fp)
-                val = model.predict_structure(s).item()
-                info["formation_energy"] = float(val)
-                results.append(info)
+                if not os.path.exists(cif_path):
+                    entry["error"] = "File not found"
+                    results.append(entry)
+                    continue
+
+                structure = Structure.from_file(cif_path)
+                
+                # Predict
+                # The model returns a tensor, we need a float
+                prediction = model.predict_structure(structure)
+                val = prediction.item() if hasattr(prediction, "item") else float(prediction)
+                
+                entry["formation_energy"] = val
+                
             except Exception as e:
-                info["error"] = f"Prediction failed with error: {str(e)}"
-                results.append(info)
+                entry["error"] = str(e)
+            
+            results.append(entry)
 
     except Exception as e:
-        results = [{"error": f"Worker crashed (Import/Setup): {str(e)}", "file_path": "N/A"}]
+        # Catch loading errors (e.g. library missing)
+        results = [{"error": f"CRITICAL WORKER FAILURE: {str(e)}"}]
 
-    print(json.dumps(results if results else []))
+    # Return JSON to the Oracle
+    print(json.dumps(results))
 
-if __name__ == "__main__": main()
-    
+if __name__ == "__main__":
+    main()
