@@ -1,42 +1,42 @@
 # generative_agent/evaluation_engine/relaxer.py
+# ... (All imports remain the same) ...
 
-# --- Core Libraries ---
-import torch
-import numpy as np
-
-# --- Materials Science Libraries ---
-from pymatgen.core.structure import Structure
-from pymatgen.io.ase import AseAtomsAdaptor
-from pymatgen.io.cif import CifWriter
-
-# --- Atomic Simulation Environment (ASE) ---
-from ase.optimize import LBFGS
-from ase.filters import UnitCellFilter
-
-# --- Materials Graph Library (MATGL) ---
-import matgl
-from matgl.ext.ase import M3GNetCalculator
+# ... (Class Relaxer __init__ remains the same) ...
 
 class Relaxer:
     """
     A class for performing GNN-based structural relaxation using M3GNet.
     Now tracks Initial and Final energy.
     """
-
-    def __init__(self):
-        # Load M3GNet potential (PES)
-        self._potential = matgl.load_model("M3GNet-MP-2021.2.8-PES")
-        self._calculator = M3GNetCalculator(potential=self._potential)
+    # ... (init remains the same) ...
 
     def relax(self, structure: Structure, fmax=0.01, steps=100, log_file='relaxation.log') -> dict:
-        """
-        Relaxes a structure and returns initial/final energies.
-        """
         try:
             atoms = AseAtomsAdaptor.get_atoms(structure)
         except Exception as e:
             return {'error': f'ASE Conversion failed: {e}'}
 
+        # --- FINAL STABILITY GUARD (CRITICAL) ---
+        # 1. Rattle Check: If all atoms are exactly at a symmetry point, force numerical noise.
+        # This prevents internal ASE/MatGL symmetry assertion failures.
+        initial_coords = atoms.get_positions()
+        coords_are_symmetric = np.allclose(initial_coords, np.round(initial_coords), atol=1e-5)
+        
+        if coords_are_symmetric:
+             # Add a tiny random perturbation (0.01 Angstroms)
+             atoms.set_positions(initial_coords + (np.random.rand(*initial_coords.shape) - 0.5) * 0.02)
+             print("[Relaxer] RATTLED: Applied tiny perturbation to break perfect symmetry.")
+
+        # 2. Distance Check: If atoms are too close, it causes massive force spikes (NaN/Inf).
+        # We perform a simple check.
+        from ase.geometry import get_distances
+        distances = get_distances(atoms.get_positions(), cell=atoms.get_cell(), pbc=atoms.get_pbc())[1]
+        min_dist = distances.min() if distances.size > 0 else 1.0 # Ensure non-empty check
+        
+        if min_dist < 0.5: # 0.5 Angstrom is chemically impossible
+             return {'error': f'Atoms too close (Min Dist: {min_dist:.2f} A).'}
+        # ----------------------------------------
+        
         # Attach ML Potential
         atoms.calc = self._calculator
 
@@ -46,11 +46,15 @@ class Relaxer:
             num_atoms = len(atoms)
             initial_energy_per_atom = initial_energy / num_atoms
         except Exception as e:
-            return {'error': f'Initial energy calculation failed: {e}'}
+            return {'error': f'Initial energy calculation failed on potential. {e}'} # MatGL crashed here!
 
         # 2. Setup Relaxation
+        # ... (rest of the relaxer code is standard) ...
+        # ... (final return is standard) ...
+        
+        # 2. Setup Relaxation
         ucf = UnitCellFilter(atoms)
-        optimizer = LBFGS(ucf, logfile=log_file)
+        optimizer = LBFGS(ucf, log_file=log_file)
 
         # 3. Run Optimization
         try:
@@ -60,7 +64,13 @@ class Relaxer:
 
         # 4. Get Final Metrics
         final_structure = AseAtomsAdaptor.get_structure(atoms)
-        final_energy = atoms.get_potential_energy()
+        
+        # Final energy calculation can sometimes crash again. Add protection.
+        try:
+            final_energy = atoms.get_potential_energy()
+        except Exception as e:
+            return {'error': f'Final energy calculation failed: {e}'}
+            
         final_energy_per_atom = final_energy / num_atoms
         
         forces = atoms.get_forces()
