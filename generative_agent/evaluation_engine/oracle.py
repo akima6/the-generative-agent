@@ -10,7 +10,7 @@ from pymatgen.io.cif import CifWriter
 
 class Oracle:
     def __init__(self, matgl_env_name=None, megnet_env_name=None):
-        # We accept the args to keep compatibility with old code, 
+        # We accept the args to keep compatibility with old calls, 
         # but we ignore them in the Single-Env setup.
         
         # Locate workers relative to this file
@@ -21,8 +21,9 @@ class Oracle:
     def _run_worker(self, script, cifs):
         """
         Runs the worker script using the CURRENT Python environment.
+        Replaces 'conda run' with 'sys.executable'.
         """
-        # CMD: python script.py file1.cif file2.cif ...
+        # CMD: /path/to/python script.py file1.cif file2.cif ...
         cmd = [sys.executable, str(script)] + cifs
         
         try:
@@ -32,6 +33,10 @@ class Oracle:
             print(f"[Oracle Error] Worker {script.name} failed.")
             print(f"STDOUT: {e.stdout}")
             print(f"STDERR: {e.stderr}")
+            return []
+        except json.JSONDecodeError:
+            print(f"[Oracle Error] Worker {script.name} returned invalid JSON.")
+            print(f"STDOUT: {res.stdout}")
             return []
         except Exception as e:
             print(f"[Oracle Error] Unexpected: {e}")
@@ -44,21 +49,27 @@ class Oracle:
             cifs = []
             for i, s in enumerate(structures):
                 p = os.path.join(tmp, f"{i}.cif")
-                CifWriter(s).write_file(p)
-                cifs.append(p)
+                try:
+                    CifWriter(s).write_file(p)
+                    cifs.append(p)
+                except:
+                    pass
             
-            # Run Formation Energy Worker (MatGL)
+            if not cifs: return []
+
+            # 1. Run Formation Energy Worker (MatGL)
             fe_res = self._run_worker(self.fe_script, cifs)
             
-            # Run Band Gap Worker (MEGNET)
+            # 2. Run Band Gap Worker (MEGNET)
             bg_res = self._run_worker(self.bg_script, cifs)
             
-            # Map results
+            # Map results by file path
             fe_map = {r.get("file_path"): r for r in fe_res}
             bg_map = {r.get("file_path"): r for r in bg_res}
             
             final = []
             for p in cifs:
+                # Combine results
                 final.append({
                     "formation_energy": fe_map.get(p, {}).get("formation_energy"),
                     "band_gap": bg_map.get(p, {}).get("band_gap"),
