@@ -11,6 +11,8 @@ from ase.filters import UnitCellFilter
 
 # --- MATGL (NEW API) ---
 import matgl
+matgl.set_backend("DGL")
+
 from matgl.ext.ase import Relaxer as MatglRelaxer
 
 
@@ -20,10 +22,11 @@ class Relaxer:
     """
 
     def __init__(self):
-        # Load pretrained M3GNet PES
+        import matgl
+        matgl.set_backend("DGL")
+
         self._potential = matgl.load_model("M3GNet-MP-2021.2.8-PES")
 
-        # MATGL-native relaxer
         self._relaxer = MatglRelaxer(
             potential=self._potential,
             optimizer="LBFGS",
