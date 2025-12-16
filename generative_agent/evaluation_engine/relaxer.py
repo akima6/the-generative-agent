@@ -95,7 +95,8 @@ class Relaxer:
 
         return {
             'final_structure': final_structure,
-            'initial_energy_per_atom': final_energy_per_atom, # Energy is always final/relaxed
+            # CHANGE THIS LINE: Use the variable 'initial_energy_per_atom' calculated earlier
+            'initial_energy_per_atom': initial_energy_per_atom, 
             'final_energy_per_atom': final_energy_per_atom,
             'energy_delta': initial_energy_per_atom - final_energy_per_atom,
             'is_converged': is_converged,
