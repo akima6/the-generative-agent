@@ -37,42 +37,40 @@ class Relaxer:
             relax_cell=True
         )
 
-    def relax(self, structure: Structure, fmax=0.01, steps=100) -> dict:
-        """
-        Relax a pymatgen Structure and return standardized results.
-        """
-        try:
-            atoms = AseAtomsAdaptor.get_atoms(structure)
-        except Exception as e:
-            return {"error": f"ASE conversion failed: {e}"}
+def relax(self, structure: Structure, fmax=0.01, steps=100) -> dict:
+    from pymatgen.io.ase import AseAtomsAdaptor
 
-        num_atoms = len(atoms)
+    try:
+        atoms = AseAtomsAdaptor.get_atoms(structure)
+    except Exception as e:
+        return {"error": f"ASE conversion failed: {e}", "is_converged": False}
 
-        # --- Initial energy ---
-        try:
-            initial_energy = self._relaxer.calculator.get_potential_energy(atoms)
-            initial_energy_per_atom = initial_energy / num_atoms
-        except Exception:
-            initial_energy_per_atom = None
+    num_atoms = len(atoms)
 
-        # --- Relax ---
-        try:
-            result = self._relaxer.relax(atoms, fmax=fmax, steps=steps)
-        except Exception as e:
-            return {"error": f"Relaxation failed: {e}"}
+    # --- Relax ---
+    try:
+        result = self._relaxer.relax(atoms, fmax=fmax, steps=steps)
+    except Exception as e:
+        return {"error": f"Relaxation failed: {e}", "is_converged": False}
 
-        final_atoms = result["final_atoms"]
-        final_structure = AseAtomsAdaptor.get_structure(final_atoms)
+    # ✅ Correct keys for MATGL >= 1.0
+    relaxed_atoms = result["atoms"]
+    converged = result.get("converged", False)
 
+    final_structure = AseAtomsAdaptor.get_structure(relaxed_atoms)
+
+    # Energy per atom (last step)
+    if "trajectory" in result and len(result["trajectory"].energies) > 0:
         final_energy = result["trajectory"].energies[-1]
         final_energy_per_atom = final_energy / num_atoms
+        num_steps = len(result["trajectory"].energies)
+    else:
+        final_energy_per_atom = None
+        num_steps = None
 
-        is_converged = result.get("converged", False)
-
-        return {
-            "final_structure": final_structure,
-            "initial_energy_per_atom": initial_energy_per_atom,
-            "final_energy_per_atom": final_energy_per_atom,
-            "is_converged": is_converged,
-            "num_steps": len(result["trajectory"].energies),
-        }
+    return {
+        "final_structure": final_structure,
+        "final_energy_per_atom": final_energy_per_atom,
+        "is_converged": converged,
+        "num_steps": num_steps,
+    }
