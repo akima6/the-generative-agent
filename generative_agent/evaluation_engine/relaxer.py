@@ -39,6 +39,7 @@ class Relaxer:
 
 def relax(self, structure, fmax=0.01, steps=100):
     from pymatgen.io.ase import AseAtomsAdaptor
+    from ase.atoms import Atoms
 
     atoms = AseAtomsAdaptor.get_atoms(structure)
     num_atoms = len(atoms)
@@ -51,37 +52,53 @@ def relax(self, structure, fmax=0.01, steps=100):
             "error": str(e)
         }
 
-    # 🔍 DEBUG (print keys once)
-    if not hasattr(self, "_printed_keys"):
-        print("MATGL relax() returned keys:", result.keys())
-        self._printed_keys = True
+    # ======================================================
+    # CASE 1: MATGL returns ase.Atoms directly
+    # ======================================================
+    if isinstance(result, Atoms):
+        relaxed_atoms = result
+        converged = True
+        final_energy_per_atom = None
+        num_steps = None
 
-    # --- Find relaxed atoms safely ---
-    if "atoms" in result:
-        relaxed_atoms = result["atoms"]
-    elif "final_atoms" in result:
-        relaxed_atoms = result["final_atoms"]
+    # ======================================================
+    # CASE 2: MATGL returns a dictionary
+    # ======================================================
+    elif isinstance(result, dict):
+        converged = result.get("converged", False)
+
+        if "atoms" in result:
+            relaxed_atoms = result["atoms"]
+        elif "final_atoms" in result:
+            relaxed_atoms = result["final_atoms"]
+        else:
+            return {
+                "is_converged": False,
+                "error": f"Unknown MATGL result keys: {result.keys()}"
+            }
+
+        # Energy
+        final_energy_per_atom = None
+        num_steps = None
+        if "trajectory" in result and hasattr(result["trajectory"], "energies"):
+            if len(result["trajectory"].energies) > 0:
+                final_energy_per_atom = result["trajectory"].energies[-1] / num_atoms
+                num_steps = len(result["trajectory"].energies)
+
+    # ======================================================
+    # CASE 3: Unknown return type
+    # ======================================================
     else:
         return {
             "is_converged": False,
-            "error": f"No atoms found in relaxer result keys: {result.keys()}"
+            "error": f"Unknown MATGL return type: {type(result)}"
         }
 
     final_structure = AseAtomsAdaptor.get_structure(relaxed_atoms)
 
-    # --- Energy ---
-    energy = None
-    steps_done = None
-    if "trajectory" in result and hasattr(result["trajectory"], "energies"):
-        if len(result["trajectory"].energies) > 0:
-            energy = result["trajectory"].energies[-1] / num_atoms
-            steps_done = len(result["trajectory"].energies)
-
-    converged = result.get("converged", False)
-
     return {
         "final_structure": final_structure,
-        "final_energy_per_atom": energy,
+        "final_energy_per_atom": final_energy_per_atom,
         "is_converged": converged,
-        "num_steps": steps_done,
+        "num_steps": num_steps,
     }
