@@ -10,8 +10,12 @@ from ase.optimize import LBFGS
 from ase.filters import UnitCellFilter
 
 # --- MATGL (NEW API) ---
+import os
+os.environ["DGLBACKEND"] = "pytorch"
+
 import matgl
 matgl.set_backend("DGL")
+
 
 from matgl.ext.ase import Relaxer as MatglRelaxer
 
