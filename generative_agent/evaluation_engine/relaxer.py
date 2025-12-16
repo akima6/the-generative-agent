@@ -37,40 +37,51 @@ class Relaxer:
             relax_cell=True
         )
 
-def relax(self, structure: Structure, fmax=0.01, steps=100) -> dict:
+def relax(self, structure, fmax=0.01, steps=100):
     from pymatgen.io.ase import AseAtomsAdaptor
 
-    try:
-        atoms = AseAtomsAdaptor.get_atoms(structure)
-    except Exception as e:
-        return {"error": f"ASE conversion failed: {e}", "is_converged": False}
-
+    atoms = AseAtomsAdaptor.get_atoms(structure)
     num_atoms = len(atoms)
 
-    # --- Relax ---
     try:
         result = self._relaxer.relax(atoms, fmax=fmax, steps=steps)
     except Exception as e:
-        return {"error": f"Relaxation failed: {e}", "is_converged": False}
+        return {
+            "is_converged": False,
+            "error": str(e)
+        }
 
-    # ✅ Correct keys for MATGL >= 1.0
-    relaxed_atoms = result["atoms"]
-    converged = result.get("converged", False)
+    # 🔍 DEBUG (print keys once)
+    if not hasattr(self, "_printed_keys"):
+        print("MATGL relax() returned keys:", result.keys())
+        self._printed_keys = True
+
+    # --- Find relaxed atoms safely ---
+    if "atoms" in result:
+        relaxed_atoms = result["atoms"]
+    elif "final_atoms" in result:
+        relaxed_atoms = result["final_atoms"]
+    else:
+        return {
+            "is_converged": False,
+            "error": f"No atoms found in relaxer result keys: {result.keys()}"
+        }
 
     final_structure = AseAtomsAdaptor.get_structure(relaxed_atoms)
 
-    # Energy per atom (last step)
-    if "trajectory" in result and len(result["trajectory"].energies) > 0:
-        final_energy = result["trajectory"].energies[-1]
-        final_energy_per_atom = final_energy / num_atoms
-        num_steps = len(result["trajectory"].energies)
-    else:
-        final_energy_per_atom = None
-        num_steps = None
+    # --- Energy ---
+    energy = None
+    steps_done = None
+    if "trajectory" in result and hasattr(result["trajectory"], "energies"):
+        if len(result["trajectory"].energies) > 0:
+            energy = result["trajectory"].energies[-1] / num_atoms
+            steps_done = len(result["trajectory"].energies)
+
+    converged = result.get("converged", False)
 
     return {
         "final_structure": final_structure,
-        "final_energy_per_atom": final_energy_per_atom,
+        "final_energy_per_atom": energy,
         "is_converged": converged,
-        "num_steps": num_steps,
+        "num_steps": steps_done,
     }
