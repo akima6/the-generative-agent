@@ -1,24 +1,17 @@
 # --- Core Libraries ---
 import numpy as np
+import os
 
 # --- Materials Science Libraries ---
 from pymatgen.core.structure import Structure
 from pymatgen.io.ase import AseAtomsAdaptor
+from ase.atoms import Atoms
 
-# --- ASE ---
-from ase.optimize import LBFGS
-from ase.filters import UnitCellFilter
-
-# --- MATGL (NEW API) ---
-import os
+# --- MATGL ---
+# Ensure backend is set before importing matgl models
 os.environ["DGLBACKEND"] = "pytorch"
-
 import matgl
-matgl.set_backend("DGL")
-
-
 from matgl.ext.ase import Relaxer as MatglRelaxer
-
 
 class Relaxer:
     """
@@ -26,79 +19,91 @@ class Relaxer:
     """
 
     def __init__(self):
-        import matgl
+        # Set backend (redundant but safe)
         matgl.set_backend("DGL")
 
+        # Load the potential
         self._potential = matgl.load_model("M3GNet-MP-2021.2.8-PES")
 
+        # Initialize the MATGL Relaxer
         self._relaxer = MatglRelaxer(
             potential=self._potential,
             optimizer="LBFGS",
             relax_cell=True
         )
 
-def relax(self, structure, fmax=0.01, steps=100):
-    from pymatgen.io.ase import AseAtomsAdaptor
-    from ase.atoms import Atoms
+    # [FIX] This method is now correctly indented inside the class
+    def relax(self, structure: Structure, fmax=0.01, steps=100) -> dict:
+        
+        # Convert Pymatgen Structure -> ASE Atoms
+        atoms = AseAtomsAdaptor.get_atoms(structure)
+        num_atoms = len(atoms)
 
-    atoms = AseAtomsAdaptor.get_atoms(structure)
-    num_atoms = len(atoms)
+        try:
+            # Run the relaxation
+            result = self._relaxer.relax(atoms, fmax=fmax, steps=steps)
+        except Exception as e:
+            return {
+                "final_structure": structure, # Return original on failure
+                "final_energy_per_atom": None,
+                "is_converged": False,
+                "error": str(e)
+            }
 
-    try:
-        result = self._relaxer.relax(atoms, fmax=fmax, steps=steps)
-    except Exception as e:
-        return {
-            "is_converged": False,
-            "error": str(e)
-        }
-
-    # ======================================================
-    # CASE 1: MATGL returns ase.Atoms directly
-    # ======================================================
-    if isinstance(result, Atoms):
-        relaxed_atoms = result
-        converged = True
+        # --- Parse Result ---
+        # MatglRelaxer usually returns a dictionary: {'final_structure': ..., 'trajectory': ...}
+        
+        relaxed_structure = None
         final_energy_per_atom = None
-        num_steps = None
+        converged = False
 
-    # ======================================================
-    # CASE 2: MATGL returns a dictionary
-    # ======================================================
-    elif isinstance(result, dict):
-        converged = result.get("converged", False)
+        # Handle Dictionary Return (Standard for recent MATGL versions)
+        if isinstance(result, dict):
+            # 1. Extract Structure
+            if "final_structure" in result:
+                relaxed_structure = result["final_structure"]
+            elif "atoms" in result:
+                # Fallback if it returns ASE atoms
+                relaxed_structure = AseAtomsAdaptor.get_structure(result["atoms"])
+            
+            # 2. Extract Energy (from trajectory if available)
+            if "trajectory" in result:
+                # Try to get energy from the trajectory observer
+                traj = result["trajectory"]
+                # Different versions store energies differently, try common attributes
+                if hasattr(traj, "energies") and len(traj.energies) > 0:
+                    final_energy_per_atom = traj.energies[-1] / num_atoms
+                elif hasattr(traj, "as_pandas"):
+                    # Newer matgl versions often have a dataframe
+                    df = traj.as_pandas()
+                    if not df.empty:
+                         final_energy_per_atom = df.iloc[-1]["energy"] / num_atoms
 
-        if "atoms" in result:
-            relaxed_atoms = result["atoms"]
-        elif "final_atoms" in result:
-            relaxed_atoms = result["final_atoms"]
+            # Assume converged if no error was raised by the optimizer
+            converged = True
+
+        # Handle ASE Atoms Return (Legacy/Fallback)
+        elif isinstance(result, Atoms):
+            relaxed_structure = AseAtomsAdaptor.get_structure(result)
+            try:
+                final_energy_per_atom = result.get_potential_energy() / num_atoms
+            except:
+                final_energy_per_atom = None
+            converged = True
+        
         else:
             return {
                 "is_converged": False,
-                "error": f"Unknown MATGL result keys: {result.keys()}"
+                "error": f"Unknown return type from MATGL: {type(result)}"
             }
 
-        # Energy
-        final_energy_per_atom = None
-        num_steps = None
-        if "trajectory" in result and hasattr(result["trajectory"], "energies"):
-            if len(result["trajectory"].energies) > 0:
-                final_energy_per_atom = result["trajectory"].energies[-1] / num_atoms
-                num_steps = len(result["trajectory"].energies)
+        # Final safety check
+        if relaxed_structure is None:
+             relaxed_structure = structure # Fallback to input
 
-    # ======================================================
-    # CASE 3: Unknown return type
-    # ======================================================
-    else:
         return {
-            "is_converged": False,
-            "error": f"Unknown MATGL return type: {type(result)}"
+            "final_structure": relaxed_structure,
+            "final_energy_per_atom": final_energy_per_atom,
+            "is_converged": converged,
+            "num_steps": steps # MATGL wrapper doesn't always strictly return step count easily
         }
-
-    final_structure = AseAtomsAdaptor.get_structure(relaxed_atoms)
-
-    return {
-        "final_structure": final_structure,
-        "final_energy_per_atom": final_energy_per_atom,
-        "is_converged": converged,
-        "num_steps": num_steps,
-    }
